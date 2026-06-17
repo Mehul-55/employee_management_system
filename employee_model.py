@@ -1,6 +1,7 @@
 import sys, os
 sys.path.append(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 from db_config import db as _db, employees_col
+from app_time import now_stamp as _app_now_stamp
 try:
     employees_col.create_index("emp_id", unique=True)
 except Exception:
@@ -184,7 +185,7 @@ def delete_employee(emp_id):
 
     result = employees_col.update_one(
         {"emp_id": emp_id},
-        {"$set": {"deleted": True, "deleted_at": __import__("datetime").datetime.now().strftime("%Y-%m-%d %H:%M:%S")}}
+        {"$set": {"deleted": True, "deleted_at": _app_now_stamp()}}
     )
 
     if result.modified_count:

@@ -27,6 +27,11 @@ import hmac
 import secrets
 from bson import ObjectId
 
+from app_time import now_stamp as _app_now_stamp
+from app_time import now_time as _app_now_time
+from app_time import today_date as _app_today_date
+from app_time import today_iso as _app_today_iso
+from app_time import trusted_now as _app_trusted_now
 from db_config import db as _db, employees_col
 departments_col = _db["departments"]
 salary_history_col = _db["salary_history"]
@@ -112,7 +117,7 @@ def _login_identifier(login_type, identifier):
 
 
 def _login_lock_message(locked_until):
-    remaining = max(1, int((locked_until - datetime.utcnow()).total_seconds() // 60) + 1)
+    remaining = max(1, int((locked_until - _app_trusted_now()).total_seconds() // 60) + 1)
     return f"Too many failed login attempts. Try again in {remaining} minute(s)."
 
 
@@ -124,7 +129,7 @@ def _check_login_lock(login_type, identifier):
     if not record:
         return False, None
     locked_until = record.get("locked_until")
-    if isinstance(locked_until, datetime) and locked_until > datetime.utcnow():
+    if isinstance(locked_until, datetime) and locked_until > _app_trusted_now():
         return True, _login_lock_message(locked_until)
     return False, None
 
@@ -133,7 +138,7 @@ def _record_login_failure(login_type, identifier):
     identifier = _login_identifier(login_type, identifier)
     if not identifier:
         return
-    now = datetime.utcnow()
+    now = _app_trusted_now()
     record = login_attempts_col.find_one({"login_type": login_type, "identifier": identifier}) or {}
     failed_count = int(record.get("failed_count", 0) or 0) + 1
     update = {
@@ -191,7 +196,7 @@ def _normalize_joining_date(value):
     """
     raw = str(value or "").strip()
     if not raw:
-        return date.today().isoformat()
+        return _app_today_iso()
 
     for fmt in ("%d/%m/%y", "%d/%m/%Y", "%Y-%m-%d"):
         try:
@@ -354,7 +359,7 @@ def register_employee(
         "password":     _hash_password(password),
         "basic_salary": basic_salary,
         "joining_date": joining_date,
-        "created_at":   date.today().isoformat(),
+        "created_at":   _app_today_iso(),
     }
 
     # Optional fields — only stored when provided
@@ -450,7 +455,7 @@ def delete_emp_account(emp_id):
         {"emp_id": emp_id},
         {"$set": {
             "deleted":    True,
-            "deleted_at": _dt.utcnow().strftime("%Y-%m-%d %H:%M:%S"),
+            "deleted_at": _app_now_stamp(),
         }}
     )
     return True, f"✅ Employee ID {emp_id} deactivated (can be restored by admin)!"
@@ -463,20 +468,44 @@ def restore_employee(emp_id):
     """
     try:
         emp_id = int(emp_id)
-    except ValueError:
+    except (TypeError, ValueError):
         return False, "Employee ID must be a number!"
 
-    emp = employees_col.find_one({"emp_id": emp_id, "deleted": {"$ne": True}})
+    emp = employees_col.find_one({"emp_id": emp_id})
     if not emp:
         return False, f"No account found for Employee ID {emp_id}!"
 
     if not emp.get("deleted"):
         return False, f"Employee ID {emp_id} is not deactivated!"
 
-    employees_col.update_one(
-        {"emp_id": emp_id},
-        {"$unset": {"deleted": "", "deleted_at": ""}}
+    from datetime import datetime as _dt, timezone as _timezone
+    restored_at = _dt.now(_timezone.utc).strftime("%Y-%m-%d %H:%M:%S")
+    deleted_at = emp.get("deleted_at")
+    if not deleted_at:
+        return False, (
+            f"Employee ID {emp_id} has no deactivation timestamp. "
+            "Restore cancelled to protect report history."
+        )
+
+    result = employees_col.update_one(
+        {"emp_id": emp_id, "deleted": True, "deleted_at": deleted_at},
+        {
+            "$push": {
+                "inactive_periods": {
+                    "from": deleted_at,
+                    "to": restored_at,
+                    "reason": "deactivated",
+                }
+            },
+            "$set": {"restored_at": restored_at},
+            "$unset": {"deleted": "", "deleted_at": ""},
+        },
     )
+    if result.modified_count == 0:
+        return False, (
+            f"Employee ID {emp_id} changed while being restored. "
+            "Refresh the employee list and try again."
+        )
     return True, f"✅ Employee ID {emp_id} restored successfully!"
 
 
@@ -486,7 +515,7 @@ def restore_employee(emp_id):
 # ══════════════════════════════════════════════
 def _normalize_effective_date(value=None):
     if not value:
-        return date.today().isoformat()
+        return _app_today_iso()
     if isinstance(value, datetime):
         return value.date().isoformat()
     if isinstance(value, date):
@@ -508,7 +537,7 @@ def _salary_history_object_id(history_id):
 
 
 def _sync_current_basic_salary(emp_id):
-    today = date.today().isoformat()
+    today = _app_today_iso()
     doc = salary_history_col.find_one(
         {"emp_id": emp_id, "effective_from": {"$lte": today}},
         sort=[("effective_from", -1), ("created_at", -1)]
@@ -563,7 +592,7 @@ def set_basic_salary(emp_id, basic_salary, effective_from=None, note=""):
     if new_salary < 0:
         return False, "Salary change cannot make basic salary negative!"
 
-    timestamp = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+    timestamp = _app_now_stamp()
     if not salary_history_col.find_one({"emp_id": emp_id}):
         salary_history_col.insert_one({
             "emp_id": emp_id,
@@ -646,7 +675,7 @@ def update_salary_history_entry(history_id, basic_salary, effective_from, note="
             "basic_salary": basic_salary,
             "effective_from": effective_from,
             "note": str(note or "").strip(),
-            "updated_at": datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
+            "updated_at": _app_now_stamp(),
         }}
     )
     _sync_current_basic_salary(int(existing["emp_id"]))
@@ -749,10 +778,10 @@ notifications_col = _db["notifications"]
 holidays_col = _db["holidays"]
 
 def _today():
-    return date.today().strftime("%Y-%m-%d")   # e.g. "2026-05-26"
+    return _app_today_iso()   # e.g. "2026-05-26"
 
 def _now():
-    return datetime.now().strftime("%H:%M:%S") # e.g. "09:32:11"
+    return _app_now_time(include_seconds=True) # e.g. "09:32:11"
 
 
 def _parse_yyyy_mm_dd(value, label="Date"):
@@ -765,35 +794,58 @@ def _parse_yyyy_mm_dd(value, label="Date"):
     raise ValueError(f"{label} must use DD/MM/YY format.")
 
 
-def _get_holiday_dates():
+def _get_holiday_dates(start_date=None, end_date=None):
+    """Fallback holiday lookup using the same active-record rules as payroll."""
     holidays = set()
-    try:
-        for doc in holidays_col.find({}, {"_id": 0, "date": 1}):
-            value = doc.get("date")
+    for field in ("date", "holiday_date", "day"):
+        query = {
+            "active": {"$ne": False},
+            "deleted": {"$ne": True},
+        }
+        if start_date and end_date:
+            query[field] = {"$gte": str(start_date), "$lte": str(end_date)}
+        try:
+            docs = holidays_col.find(query, {"_id": 0, field: 1})
+        except Exception:
+            continue
+        for doc in docs:
+            value = doc.get(field)
             if isinstance(value, datetime):
-                holidays.add(value.date().strftime("%Y-%m-%d"))
+                holidays.add(value.date().isoformat())
             elif isinstance(value, date):
-                holidays.add(value.strftime("%Y-%m-%d"))
+                holidays.add(value.isoformat())
             elif value:
                 holidays.add(str(value)[:10])
-    except Exception:
-        pass
     return holidays
 
 
 def _business_dates(emp_id, start_date, end_date):
-    holidays = _get_holiday_dates()
+    start_iso = start_date.isoformat()
+    end_iso = end_date.isoformat()
+    try:
+        from shift_model import (
+            get_holidays_for_range,
+            get_sunday_work_approval_dates_for_range,
+        )
+        holidays = {
+            str(item.get("_holiday_date"))
+            for item in get_holidays_for_range(start_iso, end_iso)
+            if item.get("_holiday_date")
+        }
+        sunday_work_dates = get_sunday_work_approval_dates_for_range(
+            emp_id,
+            start_iso,
+            end_iso,
+        )
+    except Exception:
+        holidays = _get_holiday_dates(start_iso, end_iso)
+        sunday_work_dates = set()
+
     days = []
     current = start_date
     while current <= end_date:
-        current_str = current.strftime("%Y-%m-%d")
-        sunday_work_approved = False
-        if current.weekday() == 6:
-            try:
-                from shift_model import get_sunday_work_approval_dates_for_range
-                sunday_work_approved = current_str in get_sunday_work_approval_dates_for_range(emp_id, current_str, current_str)
-            except Exception:
-                sunday_work_approved = False
+        current_str = current.isoformat()
+        sunday_work_approved = current_str in sunday_work_dates
         # The attendance/payroll system treats Sunday as the weekly holiday.
         # Saturday is therefore a normal leave-working day.
         if (current.weekday() != 6 or sunday_work_approved) and current_str not in holidays:
@@ -969,12 +1021,13 @@ def get_employee_leaves(emp_id):
 
 
 # ══════════════════════════════════════════════
-#  12. DEDUCT LEAVE  (Internal — called auto)
+#  12. DEDUCT LEAVE  (Legacy utility)
 # ══════════════════════════════════════════════
 def deduct_leave(emp_id):
     """
     Deducts 1 leave from an employee's balance.
-    Called automatically when admin marks absent.
+    Manual absence must not call this function. Paid leave is consumed only
+    through the approved leave-request workflow so payroll can recognize it.
     Returns (True, message) or (False, error)
     """
     try:
@@ -1024,7 +1077,8 @@ def mark_attendance(emp_id, status):
     Admin marks an employee present or absent.
     Delegates to attendance.py so the written document always matches
     the canonical schema (arrival_time, shift, late_minutes, etc.).
-    If absent — automatically deducts a leave.
+    Marking absent does not consume leave. Leave balance is consumed only
+    when a leave request is approved.
     Returns (True, message) or (False, error)
     """
     try:
@@ -1041,11 +1095,7 @@ def mark_attendance(emp_id, status):
         return False, "Attendance module not available. Contact admin."
 
     if status == "absent":
-        ok, msg = mark_absent(emp_id)
-        if ok:
-            deduct_leave(emp_id)
-            return True, f"✅ Employee ID {emp_id} marked absent & leave deducted!"
-        return False, msg
+        return mark_absent(emp_id)
 
     return mark_arrival(emp_id)
 
@@ -1062,14 +1112,56 @@ def get_daily_report(query_date=None):
         datetime.strptime(query_date, "%Y-%m-%d")
     except (TypeError, ValueError):
         return []
-    employees = list(employees_col.find(
-        {"role": "employee", "deleted": {"$ne": True}},
-        {"password": 0}
-    ))
     try:
-        from shift_model import get_employee_shift
+        from shift_model import get_employee_shift, get_sunday_work_approval_map
     except Exception:
         get_employee_shift = None
+        get_sunday_work_approval_map = None
+    try:
+        from attendance import (
+            employee_active_on_date,
+            get_approved_leave_for_date,
+            get_holiday,
+            is_missed_checkout,
+            resolve_daily_report_status,
+        )
+    except Exception:
+        employee_active_on_date = None
+        get_approved_leave_for_date = None
+        get_holiday = None
+        is_missed_checkout = None
+        resolve_daily_report_status = None
+
+    all_employees = list(employees_col.find(
+        {"role": "employee"},
+        {"password": 0},
+    ))
+    if employee_active_on_date:
+        employees = [
+            emp for emp in all_employees
+            if employee_active_on_date(emp, query_date)
+        ]
+    else:
+        employees = [
+            emp for emp in all_employees
+            if not emp.get("deleted")
+        ]
+
+    is_sunday = datetime.strptime(query_date, "%Y-%m-%d").weekday() == 6
+    try:
+        is_public_holiday = bool(get_holiday(query_date)) if get_holiday else False
+    except Exception:
+        is_public_holiday = False
+    sunday_approvals = {}
+    if is_sunday and get_sunday_work_approval_map:
+        try:
+            sunday_approvals = get_sunday_work_approval_map(
+                [emp.get("emp_id") for emp in employees],
+                query_date,
+                query_date,
+            )
+        except Exception:
+            sunday_approvals = {}
 
     report = []
     for emp in employees:
@@ -1079,23 +1171,36 @@ def get_daily_report(query_date=None):
             "date": query_date,
             "deleted": {"$ne": True},
         }) or {}
-        status = att.get("status", "Not Marked")
-        leave = leave_requests_col.find_one({
-            "emp_id": emp_id,
-            "status": {"$in": ["Approved", "Revert Requested"]},
-            "$or": [
-                {"working_dates": query_date},
-                {"from_date": {"$lte": query_date}, "to_date": {"$gte": query_date}},
-            ],
-        })
-        if leave:
-            status = "Approved Leave"
-            att = {}
+        try:
+            leave = (
+                get_approved_leave_for_date(emp_id, query_date)
+                if get_approved_leave_for_date
+                else None
+            )
+        except Exception:
+            leave = None
+        is_sunday_off = (
+            is_sunday
+            and query_date not in sunday_approvals.get(emp_id, set())
+        )
+        if resolve_daily_report_status:
+            status, att = resolve_daily_report_status(
+                att,
+                approved_leave=bool(leave),
+                paid_holiday=is_public_holiday or is_sunday_off,
+            )
+        else:
+            status = att.get("status", "Not Marked")
+            if leave:
+                status = "Approved Leave"
+                att = {}
+            if is_public_holiday or is_sunday_off:
+                status = "Paid Holiday"
+                att = {}
         checkin_time = att.get("arrival_time") or att.get("checkin_time") or "-"
         checkout_time = att.get("checkout_time") or "-"
         try:
-            from attendance import is_missed_checkout
-            missed_checkout = is_missed_checkout(att)
+            missed_checkout = is_missed_checkout(att) if is_missed_checkout else False
         except Exception:
             missed_checkout = False
         late_minutes = int(att.get("late_minutes") or 0)
@@ -1184,7 +1289,7 @@ def _leave_can_be_reverted(doc):
         leave_end = _parse_yyyy_mm_dd(doc.get("to_date"), "To date")
     except ValueError:
         return False
-    return leave_end >= date.today()
+    return leave_end >= _app_today_date()
 
 
 def submit_leave_request(emp_id, leave_type, from_date, to_date, reason, leave_duration="Full Day"):
@@ -1219,7 +1324,7 @@ def submit_leave_request(emp_id, leave_type, from_date, to_date, reason, leave_d
     if d1 > d2:
         return False, "From date cannot be after To date!"
 
-    today = date.today()
+    today = _app_today_date()
     if d1 <= today:
         return False, "Leave requests must start from tomorrow or later. Today and past dates are not allowed!"
 
@@ -1250,7 +1355,7 @@ def submit_leave_request(emp_id, leave_type, from_date, to_date, reason, leave_d
 
     working_dates = _business_dates(emp_id, d1, d2)
     if not working_dates:
-        return False, "Selected dates are weekends or holidays. No leave is required for these dates."
+        return False, "Selected dates are Sunday holidays or public holidays. No leave is required for these dates."
 
     days = len(working_dates) if leave_duration == "Full Day" else duration_values[leave_duration]
 
@@ -1428,7 +1533,7 @@ def update_leave_request(request_id, action, remarks="", reviewed_by="admin"):
             leave_start = _parse_yyyy_mm_dd(doc.get("from_date"), "From date")
         except ValueError:
             return False, "Leave request has an invalid start date and cannot be approved."
-        if leave_start <= date.today():
+        if leave_start <= _app_today_date():
             return False, "Past or same-day leave requests cannot be approved."
     if action == "Reverted" and not _leave_can_be_reverted(doc):
         return False, "Leave revert is not allowed after the leave end date has passed."

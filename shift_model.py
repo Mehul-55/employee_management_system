@@ -19,6 +19,10 @@ Salary Rules:
 from datetime import datetime, timedelta, date
 import calendar
 
+from app_time import now_stamp as _app_now_stamp
+from app_time import today_date as _app_today_date
+from app_time import today_iso as _app_today_iso
+from app_time import trusted_now as _app_trusted_now
 from db_config import db as _db, employees_col
 from payroll_math import calculate_payroll_amounts, calculate_prorated_salary
 shift_assign_col = _db["shift_assignments"]
@@ -62,6 +66,7 @@ SHIFTS = {
 
 GRACE_MINUTES   = 15
 MIN_OVERTIME_AFTER_SHIFT_MINUTES = 120
+MAX_WORK_SESSION_HOURS = 12
 WORKING_DAYS    = 30
 OT_MULTIPLIER   = 1.5
 HALFDAY_LATE_THRESHOLD_RATIO = 0.25
@@ -77,7 +82,7 @@ SHIFT_COLORS = {
 # ------ Internal helpers ------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------
 def _parse_time(time_str, base_date=None):
     if base_date is None:
-        base_date = date.today()
+        base_date = _app_today_date()
     for fmt in ("%H:%M:%S", "%H:%M"):
         try:
             t = datetime.strptime(time_str, fmt).time()
@@ -85,6 +90,24 @@ def _parse_time(time_str, base_date=None):
         except ValueError:
             continue
     raise ValueError(f"Cannot parse time: '{time_str}'")
+
+
+def calculate_work_session_hours(checkin_str, checkout_str, max_hours=MAX_WORK_SESSION_HOURS):
+    """Return a valid same-day/overnight duration, or None if implausible."""
+    try:
+        checkin_dt = _parse_time(str(checkin_str)[:5])
+        checkout_dt = _parse_time(str(checkout_str)[:5])
+        max_hours = float(max_hours)
+    except (TypeError, ValueError):
+        return None
+
+    if checkout_dt < checkin_dt:
+        checkout_dt += timedelta(days=1)
+
+    hours_worked = (checkout_dt - checkin_dt).total_seconds() / 3600
+    if hours_worked < 0 or hours_worked > max_hours:
+        return None
+    return round(hours_worked, 2)
 
 
 def _days_in_month(year_month):
@@ -97,12 +120,12 @@ def _days_in_month(year_month):
 
 def _salary_period_for_month(year_month=None, payroll_cycle_start_day=1):
     if year_month is None:
-        year_month = datetime.today().strftime("%Y-%m")
+        year_month = _app_trusted_now().strftime("%Y-%m")
     try:
         year, month = map(int, str(year_month).split("-"))
         start_day = int(payroll_cycle_start_day if payroll_cycle_start_day is not None else 1)
     except (TypeError, ValueError):
-        today = date.today()
+        today = _app_today_date()
         year_month = today.strftime("%Y-%m")
         year, month = today.year, today.month
         start_day = 1
@@ -189,6 +212,8 @@ def _salary_period_for_employee(emp, salary_period):
 def _employee_overlaps_period(emp, period_start, period_end):
     joining_date = _employee_joining_date(emp)
     leaving_date = _employee_leaving_date(emp)
+    if emp.get("deleted") and not leaving_date:
+        return False
     if joining_date and joining_date > period_end:
         return False
     if leaving_date and leaving_date < period_start:
@@ -232,7 +257,7 @@ def get_basic_salary_info_for_month(emp, year_month, period_end=None):
             year, month = map(int, str(year_month).split("-"))
             month_end = f"{year_month}-{calendar.monthrange(year, month)[1]:02d}"
         except (TypeError, ValueError):
-            month_end = str(date.today())
+            month_end = _app_today_iso()
 
     doc = salary_history_col.find_one(
         {"emp_id": emp_id, "effective_from": {"$lte": month_end}},
@@ -273,7 +298,7 @@ def get_holiday(query_date=None):
     Returns a holiday document for query_date, or None.
     Supported holiday date fields: date, holiday_date, day.
     """
-    query_date = query_date or str(date.today())
+    query_date = query_date or _app_today_iso()
     return holidays_col.find_one({
         "$and": [
             {"$or": [
@@ -347,7 +372,7 @@ def approve_sunday_work(emp_id, work_date, approved_by="admin", reason=""):
             "approved_by": str(approved_by or "admin"),
             "reason": reason,
             "active": True,
-            "updated_at": datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
+            "updated_at": _app_now_stamp(),
         }},
         upsert=True,
     )
@@ -410,6 +435,18 @@ def _is_paid_sunday_for_employee(query_date, sunday_work_dates=None):
     return _is_sunday_date(query_date) and query_date not in (sunday_work_dates or set())
 
 
+def is_sunday_off(emp_id, query_date):
+    """Return True when the date is Sunday without active work approval."""
+    if not _is_sunday_date(query_date):
+        return False
+    approvals = get_sunday_work_approval_dates_for_range(
+        emp_id,
+        query_date,
+        query_date,
+    )
+    return query_date not in approvals
+
+
 def get_paid_holidays_for_range(start_date, end_date):
     """Returns paid-holiday dates in the period, including Sundays and holidays."""
     paid = {}
@@ -445,8 +482,12 @@ def get_approved_leave_credits_for_range(emp_id, start_date, end_date):
         "emp_id": int(emp_id),
         "status": {"$in": ["Approved", "Revert Requested"]},
         "$or": [
-            {"from_date": {"$lte": end_date}, "to_date": {"$gte": start_date}},
             {"working_dates": {"$elemMatch": {"$gte": start_date, "$lte": end_date}}},
+            {
+                "working_dates": {"$exists": False},
+                "from_date": {"$lte": end_date},
+                "to_date": {"$gte": start_date},
+            },
         ],
     })
 
@@ -456,7 +497,7 @@ def get_approved_leave_credits_for_range(emp_id, start_date, end_date):
         unpaid_remaining = float(doc.get("unpaid_days", max(total_days - paid_remaining, 0)) or 0)
         working_dates = list(doc.get("working_dates") or [])
 
-        if not working_dates:
+        if "working_dates" not in doc:
             try:
                 current = date.fromisoformat(doc.get("from_date"))
                 end = date.fromisoformat(doc.get("to_date"))
@@ -505,9 +546,25 @@ def assign_shift(emp_id, shift_name):
         return False, f"Invalid shift. Choose: {', '.join(SHIFTS)}."
     if not employees_col.find_one({"emp_id": emp_id, "deleted": {"$ne": True}}):
         return False, f"No employee found with ID {emp_id}!"
+    effective_from = _app_today_iso()
+    existing = shift_assign_col.find_one({"emp_id": emp_id}) or {}
+    history = _normalized_shift_history(existing)
+    history = [
+        item for item in history
+        if item["effective_from"] != effective_from
+    ]
+    history.append({
+        "shift_name": shift_name,
+        "effective_from": effective_from,
+    })
+    history.sort(key=lambda item: item["effective_from"])
     shift_assign_col.update_one(
         {"emp_id": emp_id},
-        {"$set": {"shift_name": shift_name, "assigned_on": str(date.today())}},
+        {"$set": {
+            "shift_name": shift_name,
+            "assigned_on": effective_from,
+            "history": history,
+        }},
         upsert=True
     )
     return True, f"--- {SHIFTS[shift_name]['label']} assigned to Employee ID {emp_id}!"
@@ -519,27 +576,82 @@ def assign_shift(emp_id, shift_name):
 DEFAULT_SHIFT = "Morning"
 
 
+def _normalized_shift_history(doc):
+    """Return valid, deduplicated effective-dated assignments."""
+    if not doc:
+        return []
+    by_date = {}
+    for item in doc.get("history") or []:
+        if not isinstance(item, dict):
+            continue
+        shift_name = item.get("shift_name")
+        effective_from = _as_date_string(item.get("effective_from"))
+        if shift_name in SHIFTS and effective_from:
+            by_date[effective_from] = {
+                "shift_name": shift_name,
+                "effective_from": effective_from,
+            }
+
+    legacy_shift = doc.get("shift_name")
+    legacy_date = _as_date_string(doc.get("assigned_on"))
+    if legacy_shift in SHIFTS and legacy_date and legacy_date not in by_date:
+        by_date[legacy_date] = {
+            "shift_name": legacy_shift,
+            "effective_from": legacy_date,
+        }
+    return [by_date[key] for key in sorted(by_date)]
+
+
+def _shift_from_assignment_doc(doc, query_date=None):
+    if not doc:
+        return None
+    if query_date is None:
+        shift_name = doc.get("shift_name")
+        return shift_name if shift_name in SHIFTS else None
+
+    query_date = _as_date_string(query_date)
+    if not query_date:
+        return None
+    applicable = [
+        item for item in _normalized_shift_history(doc)
+        if item["effective_from"] <= query_date
+    ]
+    if applicable:
+        return applicable[-1]["shift_name"]
+    return DEFAULT_SHIFT
+
+
 def _assign_default_shift(emp_id):
     """Assigns the default shift for active employees when none exists."""
     if not employees_col.find_one({"emp_id": emp_id, "deleted": {"$ne": True}}):
         return None
     shift_assign_col.update_one(
         {"emp_id": emp_id},
-        {"$set": {"shift_name": DEFAULT_SHIFT, "assigned_on": str(date.today())}},
+        {"$set": {
+            "shift_name": DEFAULT_SHIFT,
+            "assigned_on": _app_today_iso(),
+            "history": [{
+                "shift_name": DEFAULT_SHIFT,
+                "effective_from": _app_today_iso(),
+            }],
+        }},
         upsert=True
     )
     return DEFAULT_SHIFT
 
 
-def get_employee_shift(emp_id):
-    """Returns shift_name string. Active employees default to Morning if unassigned."""
+def get_employee_shift(emp_id, query_date=None):
+    """Return the shift effective on query_date, or the current shift."""
     try:
         emp_id = int(emp_id)
     except (ValueError, TypeError):
         return None
     doc = shift_assign_col.find_one({"emp_id": emp_id})
-    if doc and doc.get("shift_name") in SHIFTS:
-        return doc["shift_name"]
+    assigned_shift = _shift_from_assignment_doc(doc, query_date)
+    if assigned_shift:
+        return assigned_shift
+    if query_date is not None:
+        return DEFAULT_SHIFT
     return _assign_default_shift(emp_id)
 
 
@@ -569,7 +681,14 @@ def get_all_shift_assignments():
 #  4. SHIFT METRICS  (late min + OT hours)
 #     Called by attendance.py after checkout
 # ------------------------------------------------------------------------------------------------------------------------------------------
-def calculate_shift_metrics(emp_id, checkin_str, checkout_str, min_ot_minutes=None):
+def calculate_shift_metrics(
+    emp_id,
+    checkin_str,
+    checkout_str,
+    min_ot_minutes=None,
+    shift_name=None,
+    work_date=None,
+):
     """
     Returns dict:
         shift_name, late_minutes (deductable), raw_late_mins,
@@ -586,7 +705,8 @@ def calculate_shift_metrics(emp_id, checkin_str, checkout_str, min_ot_minutes=No
         min_ot_minutes = MIN_OVERTIME_AFTER_SHIFT_MINUTES
     min_ot_minutes = max(0, min_ot_minutes)
 
-    shift_name = get_employee_shift(emp_id)
+    if shift_name not in SHIFTS:
+        shift_name = get_employee_shift(emp_id, work_date)
     if not shift_name:
         return {
             "shift_name":     None,
@@ -615,7 +735,9 @@ def calculate_shift_metrics(emp_id, checkin_str, checkout_str, min_ot_minutes=No
     # If employee arrived late, their effective end = checkin + shift_hours
     # so they aren't double-penalised (late AND early exit) for the same time.
     shift_hours = SHIFTS[shift_name]["hours"]
-    hours_worked = (checkout_dt - checkin_dt).total_seconds() / 3600
+    hours_worked = calculate_work_session_hours(checkin_str, checkout_str)
+    if hours_worked is None:
+        return None
 
     # Only apply early exit if employee worked at least 50% of shift.
     # Below that, Half-Day/Absent status handles the penalty --- no double charge.
@@ -745,12 +867,12 @@ def calculate_monthly_salary(emp_id, year_month=None, ot_multiplier=None, min_ot
     except (ValueError, TypeError):
         return None
 
-    emp = employees_col.find_one({"emp_id": emp_id, "deleted": {"$ne": True}})
+    emp = employees_col.find_one({"emp_id": emp_id})
     if not emp:
         return None
 
     if year_month is None:
-        year_month = datetime.today().strftime("%Y-%m")
+        year_month = _app_trusted_now().strftime("%Y-%m")
     try:
         ot_multiplier = float(ot_multiplier if ot_multiplier is not None else OT_MULTIPLIER)
     except (TypeError, ValueError):
@@ -763,6 +885,12 @@ def calculate_monthly_salary(emp_id, year_month=None, ot_multiplier=None, min_ot
     min_ot_minutes = max(0, min_ot_minutes)
 
     salary_period = _salary_period_for_month(year_month, payroll_cycle_start_day)
+    if not _employee_overlaps_period(
+        emp,
+        salary_period["start_date"],
+        salary_period["end_date"],
+    ):
+        return None
     salary_period = _salary_period_for_employee(emp, salary_period)
     if salary_period is None:
         return None
@@ -781,7 +909,7 @@ def calculate_monthly_salary(emp_id, year_month=None, ot_multiplier=None, min_ot
         salary_period.get("full_payroll_days", payroll_days),
     )
     has_basic_salary = basic_salary > 0
-    shift_name  = get_employee_shift(emp_id) or "Morning"
+    shift_name  = get_employee_shift(emp_id, period_end) or DEFAULT_SHIFT
     shift_hours = SHIFTS[shift_name]["hours"]
 
     att_records = list(attendance_col.find(
@@ -837,7 +965,17 @@ def calculate_monthly_salary(emp_id, year_month=None, ot_multiplier=None, min_ot
             final_status = "Paid Holiday"
         elif arrival and checkout:
             if checkout:
-                metrics = calculate_shift_metrics(emp_id, arrival, checkout, min_ot_minutes=min_ot_minutes)
+                record_shift = rec.get("shift")
+                if record_shift not in SHIFTS:
+                    record_shift = get_employee_shift(emp_id, rec_date)
+                metrics = calculate_shift_metrics(
+                    emp_id,
+                    arrival,
+                    checkout,
+                    min_ot_minutes=min_ot_minutes,
+                    shift_name=record_shift,
+                    work_date=rec_date,
+                )
                 if metrics:
                     late_min     = metrics["late_minutes"]
                     ot_hours     = metrics["overtime_hours"]
@@ -1037,7 +1175,7 @@ def _leave_credits_from_docs(leave_docs, start_date, end_date, holiday_set, sund
         unpaid_remaining = float(doc.get("unpaid_days", max(total_days - paid_remaining, 0)) or 0)
         working_dates    = list(doc.get("working_dates") or [])
 
-        if not working_dates:
+        if "working_dates" not in doc:
             try:
                 current = date.fromisoformat(doc.get("from_date"))
                 end_d   = date.fromisoformat(doc.get("to_date"))
@@ -1069,7 +1207,7 @@ def _calculate_salary_from_bulk(
     emp, shift_name, basic_salary,
     att_records, leave_docs, holiday_set,
     salary_period, ot_multiplier=None, min_ot_minutes=None,
-    salary_history=None,
+    salary_history=None, shift_assignment=None,
 ):
     """
     calculate_monthly_salary() with all DB calls removed.
@@ -1151,7 +1289,20 @@ def _calculate_salary_from_bulk(
             paid_holidays += 1
             final_status   = "Paid Holiday"
         elif arrival and checkout:
-            metrics = calculate_shift_metrics(emp_id, arrival, checkout, min_ot_minutes=min_ot_minutes)
+            record_shift = rec.get("shift")
+            if record_shift not in SHIFTS:
+                record_shift = (
+                    _shift_from_assignment_doc(shift_assignment, rec_date)
+                    or shift_name
+                )
+            metrics = calculate_shift_metrics(
+                emp_id,
+                arrival,
+                checkout,
+                min_ot_minutes=min_ot_minutes,
+                shift_name=record_shift,
+                work_date=rec_date,
+            )
             if metrics:
                 late_min     = metrics["late_minutes"]
                 ot_hours     = metrics["overtime_hours"]
@@ -1327,7 +1478,7 @@ def _calculate_salary_from_bulk(
 
 def get_all_salary_summaries(year_month=None, ot_multiplier=None, min_ot_minutes=None, payroll_cycle_start_day=1):
     if year_month is None:
-        year_month = datetime.today().strftime("%Y-%m")
+        year_month = _app_trusted_now().strftime("%Y-%m")
 
     salary_period = _salary_period_for_month(year_month, payroll_cycle_start_day)
     period_start  = salary_period["start_date"]
@@ -1335,7 +1486,7 @@ def get_all_salary_summaries(year_month=None, ot_multiplier=None, min_ot_minutes
 
     # ── Bulk load 1: employees ───────────────────────────────────────────────
     employees = [
-        emp for emp in employees_col.find({"role": "employee", "deleted": {"$ne": True}}, {"password": 0})
+        emp for emp in employees_col.find({"role": "employee"}, {"password": 0})
         if _employee_overlaps_period(emp, period_start, period_end)
     ]
     if not employees:
@@ -1343,8 +1494,12 @@ def get_all_salary_summaries(year_month=None, ot_multiplier=None, min_ot_minutes
     emp_ids = [emp["emp_id"] for emp in employees]
 
     # ── Bulk load 2: shift assignments (1 query for all employees) ───────────
-    shift_docs = shift_assign_col.find({"emp_id": {"$in": emp_ids}})
-    shift_map  = {doc["emp_id"]: doc.get("shift_name") for doc in shift_docs}
+    shift_docs = list(shift_assign_col.find({"emp_id": {"$in": emp_ids}}))
+    shift_doc_map = {doc["emp_id"]: doc for doc in shift_docs}
+    shift_map = {
+        emp_id: _shift_from_assignment_doc(shift_doc_map.get(emp_id), period_end)
+        for emp_id in emp_ids
+    }
 
     # ── Bulk load 3: salary history (1 query for all employees) ─────────────
     salary_history_docs = list(salary_history_col.find(
@@ -1373,8 +1528,12 @@ def get_all_salary_summaries(year_month=None, ot_multiplier=None, min_ot_minutes
         "emp_id": {"$in": emp_ids},
         "status": {"$in": ["Approved", "Revert Requested"]},
         "$or": [
-            {"from_date": {"$lte": period_end}, "to_date": {"$gte": period_start}},
             {"working_dates": {"$elemMatch": {"$gte": period_start, "$lte": period_end}}},
+            {
+                "working_dates": {"$exists": False},
+                "from_date": {"$lte": period_end},
+                "to_date": {"$gte": period_start},
+            },
         ],
     })
     leave_map = {}
@@ -1407,6 +1566,7 @@ def get_all_salary_summaries(year_month=None, ot_multiplier=None, min_ot_minutes
             ot_multiplier = ot_multiplier,
             min_ot_minutes = min_ot_minutes,
             salary_history = salary_history_map.get(emp_id, []),
+            shift_assignment = shift_doc_map.get(emp_id),
         )
         if s:
             results.append(s)
@@ -1417,8 +1577,8 @@ def get_all_salary_summaries(year_month=None, ot_multiplier=None, min_ot_minutes
 def save_salary_summaries(year_month, summaries, generated_by="system"):
     """Stores one salary summary document per employee/month in MongoDB."""
     if not year_month:
-        year_month = datetime.today().strftime("%Y-%m")
-    saved_at = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+        year_month = _app_trusted_now().strftime("%Y-%m")
+    saved_at = _app_now_stamp()
     saved = 0
     for summary in summaries or []:
         emp_id = str(summary.get("emp_id", "")).strip()

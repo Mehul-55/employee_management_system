@@ -243,7 +243,19 @@ class ApplicationController:
             return self._admin_denied()
         import auth_model
         try:
-            return auth_model.restore_employee(emp_id)
+            ok, message = auth_model.restore_employee(emp_id)
+            if ok:
+                try:
+                    from audit_log import log_action
+                    log_action(
+                        "RESTORE_EMPLOYEE",
+                        self._current_user or "admin",
+                        target=str(emp_id),
+                        details=f"Employee ID {emp_id} was restored.",
+                    )
+                except Exception as audit_error:
+                    print(f"WARNING Audit log (restore employee) failed: {audit_error}")
+            return ok, message
         except Exception as e:
             print(f"ERROR restore_employee error: {e}")
             return False, "Restore failed due to a system error."

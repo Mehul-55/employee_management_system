@@ -15,12 +15,13 @@ from PyQt6.QtWidgets import (
     QFileDialog, QGraphicsOpacityEffect, QCheckBox, QStyle, QInputDialog
 )
 from PyQt6.QtCore import (
-    Qt, QPropertyAnimation, QEasingCurve, QTimer, QPoint, QSize, QRect,
+    Qt, QPropertyAnimation, QEasingCurve, QTimer, QPoint, QSize, QRect, QLineF,
     pyqtSignal, QParallelAnimationGroup, QDate
 )
 from PyQt6.QtGui import QFont, QColor, QPalette, QCursor, QIcon, QPainter, QPen, QPainterPath, QPixmap
 
 import attendance
+from app_time import today_iso as _app_today_iso
 from audit_log import log_action, get_recent_logs
 
 # Color Palette
@@ -439,6 +440,107 @@ def make_calendar_icon(color=TEXT, size=28):
 
     painter.end()
     return QIcon(pix)
+
+
+def make_shift_management_icon(color=TEXT, accent=ACCENT, size=28):
+    """Calendar with a clock, used for Shift Management."""
+    pix = QPixmap(size, size)
+    pix.fill(Qt.GlobalColor.transparent)
+
+    painter = QPainter(pix)
+    painter.setRenderHint(QPainter.RenderHint.Antialiasing)
+    painter.scale(size / 28, size / 28)
+
+    outline = QPen(QColor(color), 1.8)
+    outline.setCapStyle(Qt.PenCapStyle.RoundCap)
+    outline.setJoinStyle(Qt.PenJoinStyle.RoundJoin)
+    painter.setPen(outline)
+    painter.setBrush(Qt.BrushStyle.NoBrush)
+    painter.drawRoundedRect(3, 5, 20, 18, 2, 2)
+    painter.drawLine(3, 10, 23, 10)
+    painter.drawLine(8, 3, 8, 7)
+    painter.drawLine(18, 3, 18, 7)
+
+    painter.setPen(QPen(QColor(accent), 1.8))
+    painter.setBrush(QColor(BG3))
+    painter.drawEllipse(13, 13, 12, 12)
+    painter.drawLine(19, 16, 19, 19)
+    painter.drawLine(QLineF(19, 19, 22, 20.5))
+
+    painter.end()
+    return QIcon(pix)
+
+
+def make_salary_report_icon(color=TEXT, accent=ACCENT, size=28):
+    """Salary report document matching the approved folded-corner reference."""
+    pix = QPixmap(size, size)
+    pix.fill(Qt.GlobalColor.transparent)
+
+    painter = QPainter(pix)
+    painter.setRenderHint(QPainter.RenderHint.Antialiasing)
+    painter.scale(size / 28, size / 28)
+
+    navy = QColor("#0b315f")
+    teal = QColor("#12aaa5")
+    blue = QColor("#2878db")
+
+    outline = QPen(navy, 2.0)
+    outline.setCapStyle(Qt.PenCapStyle.RoundCap)
+    outline.setJoinStyle(Qt.PenJoinStyle.RoundJoin)
+    painter.setPen(outline)
+    painter.setBrush(QColor("#ffffff"))
+
+    document = QPainterPath()
+    document.moveTo(5, 2)
+    document.lineTo(18, 2)
+    document.lineTo(24, 8)
+    document.lineTo(24, 25)
+    document.quadTo(24, 26, 23, 26)
+    document.lineTo(6, 26)
+    document.quadTo(4, 26, 4, 24)
+    document.lineTo(4, 4)
+    document.quadTo(4, 2, 5, 2)
+    document.closeSubpath()
+    painter.drawPath(document)
+
+    fold = QPainterPath()
+    fold.moveTo(18, 2)
+    fold.lineTo(18, 8)
+    fold.quadTo(18, 9, 19, 9)
+    fold.lineTo(24, 9)
+    fold.closeSubpath()
+    painter.setPen(outline)
+    painter.setBrush(blue)
+    painter.drawPath(fold)
+
+    painter.setPen(QPen(teal, 1.5))
+    rupee_font = QFont("Segoe UI Symbol", 13)
+    rupee_font.setBold(True)
+    painter.setFont(rupee_font)
+    painter.drawText(QRect(6, 6, 11, 12), Qt.AlignmentFlag.AlignCenter, "₹")
+
+    lines_pen = QPen(blue, 2.0)
+    lines_pen.setCapStyle(Qt.PenCapStyle.RoundCap)
+    painter.setPen(lines_pen)
+    painter.drawLine(8, 20, 21, 20)
+    painter.drawLine(8, 24, 20, 24)
+
+    painter.end()
+    return QIcon(pix)
+
+
+def make_feature_icon(key, style, standard_icon_name):
+    if key == "shift_management":
+        return make_shift_management_icon()
+    if key == "salary_report":
+        return make_salary_report_icon()
+    standard_icon = getattr(
+        QStyle.StandardPixmap,
+        standard_icon_name,
+        QStyle.StandardPixmap.SP_FileIcon,
+    )
+    return style.standardIcon(standard_icon)
+
 
 def divider():
     line = QFrame()
@@ -1254,8 +1356,8 @@ class AdminDashboard(QWidget):
         now = _dt.now()
 
         for shift_name, hour, minute in self._SHIFT_ENDS:
-            # Always catch up once on startup. The backend resolves the most
-            # recently completed work date for each shift.
+            # Always catch up once on startup. The backend resumes from the
+            # persisted per-shift checkpoint and processes every missed date.
             self._run_auto_absent(shift_name, catchup=True)
 
             shift_end = now.replace(hour=hour, minute=minute, second=0, microsecond=0)
@@ -1376,7 +1478,7 @@ class AdminDashboard(QWidget):
 
         emp = self.controller.get_all_employees()
         emp.sort(key=lambda u: int(u["id"]) if str(u["id"]).isdigit() else 0)
-        today_str = _date.today().isoformat()
+        today_str = _app_today_iso()
         active_count = sum(1 for u in emp if self.controller.account_exists(u["id"]))
         registered_today = sum(1 for u in emp if str(u.get("created_at", "")).startswith(today_str))
 
@@ -1414,8 +1516,7 @@ class AdminDashboard(QWidget):
             btn = QPushButton(short_label)
             btn.setMinimumHeight(64)
             btn.setCursor(QCursor(Qt.CursorShape.PointingHandCursor))
-            sp = getattr(QStyle.StandardPixmap, icon_name, QStyle.StandardPixmap.SP_FileIcon)
-            btn.setIcon(self.style().standardIcon(sp))
+            btn.setIcon(make_feature_icon(key, self.style(), icon_name))
             btn.setIconSize(QSize(22, 22))
             btn.setToolTip(full_label)
             btn.setStyleSheet(f"""
@@ -2057,7 +2158,7 @@ class AdminDashboard(QWidget):
         lay  = QVBoxLayout(page); lay.setContentsMargins(28,28,28,28); lay.setSpacing(0)
         lay.addWidget(make_label("Attendance Management", 20, TEXT, bold=True))
         lay.addSpacing(4)
-        lay.addWidget(make_label(f"Today: {display_date(_date.today().isoformat())}", 13, TEXT3))
+        lay.addWidget(make_label(f"Today: {display_date(_app_today_iso())}", 13, TEXT3))
         lay.addSpacing(10)
 
         lay.addWidget(divider()); lay.addSpacing(14)
@@ -2080,16 +2181,10 @@ class AdminDashboard(QWidget):
         checkin_btn  = make_button("Check In",      color=SUCCESS, text_color="#111", hover="#388a3c", **btn_cfg)
         checkout_btn = make_button("Check Out",     color="#2980b9",text_color=TEXT,  hover="#1f6391", **btn_cfg)
         absent_btn   = make_button("Mark Absent",   danger=True,   text_color=TEXT,  **btn_cfg)
-        delete_btn   = QPushButton("Delete"); delete_btn.setMinimumHeight(38)
-        delete_btn.setStyleSheet(f"""
-            QPushButton {{ background: {BG3}; color: {TEXT2}; border: 1px solid {BORDER};
-                           border-radius: 6px; font-size: 14px; font-weight: 600; padding: 0 12px; }}
-            QPushButton:hover {{ background: {BG2}; }}
-        """)
         auto_btn         = make_button("Auto-Mark All Absent",   color="#5a3000", text_color="#ffcc66", hover="#7a4400",  **btn_cfg)
         all_present_btn  = make_button("Mark All Present",         color="#166534", text_color="#bbf7d0", hover="#14532d",  **btn_cfg)
 
-        for b in [checkin_btn, checkout_btn, absent_btn, delete_btn, auto_btn, all_present_btn]:
+        for b in [checkin_btn, checkout_btn, absent_btn, auto_btn, all_present_btn]:
             btn_row.addWidget(b)
         btn_row.addStretch()
         fl.addLayout(btn_row)
@@ -2142,7 +2237,7 @@ class AdminDashboard(QWidget):
         date_row = QWidget(); date_row.setStyleSheet("background: transparent;")
         dr = QHBoxLayout(date_row); dr.setContentsMargins(0,0,0,0); dr.setSpacing(8)
         dr.addWidget(make_label("Date:", 12, TEXT2))
-        self._att_view_date = _date.today().isoformat()
+        self._att_view_date = _app_today_iso()
         self._att_date_e = make_entry(display_date(self._att_view_date), width=180)
         self._att_date_e.setFixedHeight(36)
         self._att_date_e.setPlaceholderText("DD/MM/YY")
@@ -2211,7 +2306,7 @@ class AdminDashboard(QWidget):
                 rows_lay.addWidget(row)
 
         def _load_att_date():
-            raw = self._att_date_e.text().strip() or display_date(_date.today().isoformat())
+            raw = self._att_date_e.text().strip() or display_date(_app_today_iso())
             try:
                 raw = parse_display_date(raw)
             except ValueError:
@@ -2346,14 +2441,6 @@ class AdminDashboard(QWidget):
             msg_lbl.setText(msg); msg_lbl.setStyleSheet(f"color: {SUCCESS if ok else DANGER}; font-size: 12px;")
             _reload_table()
 
-        def do_delete():
-            eid, _ = _get_inputs()
-            if eid is None: return
-            if confirm_popup(self, "Confirm", f"Delete attendance for Emp ID {eid} on {display_date(self._att_view_date)}?"):
-                ok, msg = attendance.delete_attendance(eid, query_date=self._att_view_date, deleted_by=self.username)
-                msg_lbl.setText(msg); msg_lbl.setStyleSheet(f"color: {SUCCESS if ok else DANGER}; font-size: 12px;")
-                _reload_table()
-
         def do_auto_absent():
             if confirm_popup(
                 self,
@@ -2410,7 +2497,6 @@ class AdminDashboard(QWidget):
         checkin_btn.clicked.connect(do_checkin)
         checkout_btn.clicked.connect(do_checkout)
         absent_btn.clicked.connect(do_absent)
-        delete_btn.clicked.connect(do_delete)
         auto_btn.clicked.connect(do_auto_absent)
         all_present_btn.clicked.connect(do_all_present)
         _reload_table()
@@ -2827,7 +2913,8 @@ class AdminDashboard(QWidget):
         lay.addSpacing(12)
 
         COLUMNS = [
-            ("Emp ID", 70), ("Name", 160), ("Dept", 130), ("Recorded", 78),
+            ("Emp ID", 70), ("Name", 160), ("Dept", 130), ("Eligible", 78),
+            ("Not Marked", 88),
             ("Present", 78), ("Late", 70), ("Half Day", 82), ("Absent", 78),
             ("Missed Out", 88), ("Late Hrs", 82), ("Hours", 82), ("OT Hrs", 76), ("Attendance", 96),
         ]
@@ -2887,12 +2974,12 @@ class AdminDashboard(QWidget):
                 return
 
             total_emp_lbl.setText(str(len(report)))
-            recorded_days = sum(r["recorded_days"] for r in report)
+            eligible_days = sum(r["eligible_days"] for r in report)
             present_days = sum(r["present"] + r["late"] for r in report)
             half_days = sum(r["half_day"] for r in report)
             absent_days = sum(r["absent"] + r.get("missed_checkout", 0) for r in report)
             attendance_credit = present_days + (half_days * 0.5)
-            avg_att = round((attendance_credit / recorded_days) * 100, 2) if recorded_days else 0
+            avg_att = round((attendance_credit / eligible_days) * 100, 2) if eligible_days else 0
             present_lbl.setText(str(present_days))
             halfday_lbl.setText(str(half_days))
             absent_lbl.setText(str(absent_days))
@@ -2919,7 +3006,8 @@ class AdminDashboard(QWidget):
                     (rec["emp_id"], TEXT2),
                     (rec["name"], TEXT),
                     (rec["department"], TEXT2),
-                    (rec["recorded_days"], TEXT),
+                    (rec["eligible_days"], TEXT),
+                    (rec["not_marked"], DANGER if rec["not_marked"] else TEXT3),
                     (rec["present"], SUCCESS if rec["present"] else TEXT3),
                     (rec["late"], "#f0a500" if rec["late"] else TEXT3),
                     (rec["half_day"], "#3498db" if rec["half_day"] else TEXT3),
@@ -2958,7 +3046,8 @@ class AdminDashboard(QWidget):
 
             fields = [
                 "month", "emp_id", "name", "department", "month_days",
-                "recorded_days", "present", "late", "half_day", "absent",
+                "eligible_days", "recorded_days", "not_marked",
+                "present", "late", "half_day", "absent",
                 "missed_checkout", "total_late_hours", "total_hours_worked",
                 "total_overtime_hours", "attendance_percentage",
             ]
@@ -3758,6 +3847,7 @@ class AdminDashboard(QWidget):
             "Half-Day": "#3498db",
             "Absent": DANGER, "absent": DANGER,
             "Approved Leave": "#2980b9",
+            "Paid Holiday": "#2980b9",
             "Missed Checkout": DANGER,
             "Not Marked": TEXT3,
         }
@@ -4432,7 +4522,7 @@ class EmployeeDashboard(QWidget):
         lay  = QVBoxLayout(page); lay.setContentsMargins(28,28,28,28); lay.setSpacing(0)
         lay.addWidget(make_label("My Attendance", 20, TEXT, bold=True))
         lay.addSpacing(4)
-        lay.addWidget(make_label(f"Today: {display_date(_date.today().isoformat())}", 13, TEXT3))
+        lay.addWidget(make_label(f"Today: {display_date(_app_today_iso())}", 13, TEXT3))
         lay.addSpacing(10)
 
 

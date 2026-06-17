@@ -13,6 +13,7 @@ from datetime import date, datetime, timedelta
 
 from pymongo.errors import DuplicateKeyError
 
+from app_time import trusted_now as _app_trusted_now
 from db_config import client as _client, db as _db, employees_col
 from audit_log import log_action
 
@@ -24,14 +25,16 @@ attendance_col = _db["attendance"]
 holidays_col   = _db["holidays"]
 leave_requests_col = _db["leave_requests"]
 departments_col =_db["departments"]
+auto_absence_state_col = _db["auto_absence_state"]
 # Prevent duplicate attendance per employee per day
 try:
     attendance_col.create_index(
         [("emp_id", 1), ("date", 1)],
         unique=True
     )
+    auto_absence_state_col.create_index("shift", unique=True)
 except Exception as e:
-    print(f"[ATTENDANCE WARNING] Could not create unique attendance index: {e}")
+    print(f"[ATTENDANCE WARNING] Could not create attendance indexes: {e}")
 
 # ------------------------------------------------------------------------------------------------------------------------------------------
 # OFFICE RULES  (fallback when no shift assigned)
@@ -59,20 +62,7 @@ def _resolve_emp_id(emp_id):
         return None, "Employee ID must be a number!"
 
 def _trusted_now():
-    """
-    Prefer MongoDB server time so client clock changes do not silently control
-    employee check-in/check-out. Falls back to local time if DB time is unavailable,
-    and prints a warning so the admin knows times may be unreliable.
-    """
-    try:
-        status = _client.admin.command("serverStatus")
-        server_now = status.get("localTime")
-        if isinstance(server_now, datetime):
-            return server_now.replace(tzinfo=None)
-    except Exception as e:
-        print(f"[ATTENDANCE WARNING] MongoDB server time unavailable ({e}). "
-              f"Falling back to local system clock — check-in times may be unreliable.")
-    return datetime.now()
+    return _app_trusted_now(_client)
 
 
 def _today():
@@ -118,6 +108,24 @@ def _employee_leaving_date(emp):
     return None
 
 
+def _employee_inactive_on_date(emp, query_date):
+    query_date = _as_date_string(query_date)
+    if not query_date:
+        return False
+    for interval in emp.get("inactive_periods") or []:
+        if not isinstance(interval, dict):
+            continue
+        inactive_from = _as_date_string(
+            interval.get("from") or interval.get("start") or interval.get("deleted_at")
+        )
+        inactive_to = _as_date_string(
+            interval.get("to") or interval.get("end") or interval.get("restored_at")
+        )
+        if inactive_from and inactive_to and inactive_from < query_date < inactive_to:
+            return True
+    return False
+
+
 def _employee_overlaps_period(emp, period_start, period_end):
     joining_date = _employee_joining_date(emp)
     leaving_date = _employee_leaving_date(emp)
@@ -142,16 +150,48 @@ def _employee_active_period(emp, period_start, period_end):
     return start, end
 
 
+def employee_active_on_date(emp, query_date):
+    """Return whether an employee belonged to the workforce on query_date."""
+    query_date = _as_date_string(query_date)
+    if not emp or not query_date:
+        return False
+    if emp.get("deleted") and not _employee_leaving_date(emp):
+        return False
+    return (
+        _employee_overlaps_period(emp, query_date, query_date)
+        and not _employee_inactive_on_date(emp, query_date)
+    )
+
+
+def employee_active_during_period(emp, period_start, period_end):
+    """Return whether an employee was active for any date in the period."""
+    if not emp:
+        return False
+    if emp.get("deleted") and not _employee_leaving_date(emp):
+        return False
+    active_period = _employee_active_period(emp, period_start, period_end)
+    if not active_period:
+        return False
+    current = date.fromisoformat(active_period[0])
+    end = date.fromisoformat(active_period[1])
+    while current <= end:
+        if not _employee_inactive_on_date(emp, current.isoformat()):
+            return True
+        current += timedelta(days=1)
+    return False
+
+
 def _records_within_employment(records, emp, period_start=None, period_end=None):
     if period_start is None or period_end is None:
         dates = [r.get("date") for r in records if r.get("date")]
         period_start = min(dates) if dates else "0001-01-01"
         period_end = max(dates) if dates else "9999-12-31"
-    active_period = _employee_active_period(emp, period_start, period_end)
-    if not active_period:
-        return []
-    start, end = active_period
-    return [r for r in records if start <= str(r.get("date", "")) <= end]
+    return [
+        record
+        for record in records
+        if employee_active_on_date(emp, record.get("date"))
+        and period_start <= str(record.get("date", "")) <= period_end
+    ]
 
 
 def _time_to_datetime(time_str):
@@ -215,19 +255,63 @@ def _holiday_block_message(query_date=None):
     holiday_name = holiday.get("name") or holiday.get("title") or "Holiday"
     return f"Attendance cannot be marked on {query_date}. It is a holiday: {holiday_name}."
 
+
+def _sunday_off_block_message(emp_id, query_date):
+    try:
+        from shift_model import is_sunday_off
+        sunday_off = is_sunday_off(emp_id, query_date)
+    except Exception:
+        sunday_off = date.fromisoformat(query_date).weekday() == 6
+    if sunday_off:
+        return (
+            f"Attendance cannot be marked on {query_date}. Sunday is a paid "
+            "weekly holiday unless Sunday work is approved by admin."
+        )
+    return None
+
+
+def leave_applies_to_date(leave, query_date):
+    """
+    Modern leave records are authoritative through working_dates.
+    Only legacy records without that field may use the calendar date range.
+    """
+    if not leave:
+        return False
+    query_date = _as_date_string(query_date)
+    if not query_date:
+        return False
+    if "working_dates" in leave:
+        return query_date in {
+            str(working_date)
+            for working_date in (leave.get("working_dates") or [])
+        }
+    return (
+        str(leave.get("from_date") or "") <= query_date
+        <= str(leave.get("to_date") or "")
+    )
+
+
 def get_approved_leave_for_date(emp_id, query_date=None):
     query_date = query_date or _today()
     try:
         emp_id = int(emp_id)
     except (ValueError, TypeError):
         return None
-    return leave_requests_col.find_one({
+    base_query = {
         "emp_id": emp_id,
         "status": {"$in": ["Approved", "Revert Requested"]},
-        "$or": [
-            {"working_dates": query_date},
-            {"from_date": {"$lte": query_date}, "to_date": {"$gte": query_date}},
-        ],
+    }
+    leave = leave_requests_col.find_one({
+        **base_query,
+        "working_dates": query_date,
+    })
+    if leave:
+        return leave
+    return leave_requests_col.find_one({
+        **base_query,
+        "working_dates": {"$exists": False},
+        "from_date": {"$lte": query_date},
+        "to_date": {"$gte": query_date},
     })
 
 def _approved_leave_block_message(emp, query_date=None):
@@ -288,18 +372,27 @@ def get_approved_leave_dates_for_month(emp_id, year_month):
     except (ValueError, TypeError):
         return set()
     dates = set()
+    try:
+        year, month = map(int, str(year_month).split("-"))
+        month_start = f"{year:04d}-{month:02d}-01"
+        month_end = f"{year:04d}-{month:02d}-{calendar.monthrange(year, month)[1]:02d}"
+    except (TypeError, ValueError):
+        return set()
     docs = leave_requests_col.find({
         "emp_id": emp_id,
         "status": {"$in": ["Approved", "Revert Requested"]},
         "$or": [
-            {"from_date": {"$regex": f"^{year_month}"}},
-            {"to_date": {"$regex": f"^{year_month}"}},
-            {"working_dates": {"$elemMatch": {"$regex": f"^{year_month}"}}},
+            {"working_dates": {"$elemMatch": {"$gte": month_start, "$lte": month_end}}},
+            {
+                "working_dates": {"$exists": False},
+                "from_date": {"$lte": month_end},
+                "to_date": {"$gte": month_start},
+            },
         ],
     })
     for doc in docs:
-        working_dates = list(doc.get("working_dates") or [])
-        if working_dates:
+        if "working_dates" in doc:
+            working_dates = list(doc.get("working_dates") or [])
             dates.update(str(d) for d in working_dates if str(d).startswith(year_month))
             continue
         try:
@@ -313,6 +406,139 @@ def get_approved_leave_dates_for_month(emp_id, year_month):
                 dates.add(current_str)
             current = current.fromordinal(current.toordinal() + 1)
     return dates
+
+
+def _eligible_attendance_dates(emp_id, emp, period_start, period_end, as_of_date=None):
+    """
+    Return elapsed working dates used as the attendance percentage denominator.
+
+    Sundays, public holidays, approved leave, dates outside employment, and
+    future dates are excluded. An approved Sunday-work date is included.
+    """
+    active_period = _employee_active_period(emp, period_start, period_end)
+    if not active_period:
+        return []
+
+    active_start, active_end = active_period
+    cutoff = _as_date_string(as_of_date) or _today()
+    active_end = min(active_end, cutoff)
+    if active_start > active_end:
+        return []
+
+    leave_dates = get_approved_leave_dates_for_month(
+        emp_id,
+        active_start[:7],
+    )
+    if active_start[:7] != active_end[:7]:
+        leave_dates.update(
+            get_approved_leave_dates_for_month(emp_id, active_end[:7])
+        )
+
+    try:
+        from shift_model import (
+            get_holidays_for_range,
+            get_sunday_work_approval_dates_for_range,
+        )
+        holiday_dates = {
+            str(item.get("_holiday_date"))
+            for item in get_holidays_for_range(active_start, active_end)
+            if item.get("_holiday_date")
+        }
+        sunday_work_dates = get_sunday_work_approval_dates_for_range(
+            emp_id,
+            active_start,
+            active_end,
+        )
+    except Exception:
+        holiday_dates = set()
+        sunday_work_dates = set()
+        current = date.fromisoformat(active_start)
+        end = date.fromisoformat(active_end)
+        while current <= end:
+            current_str = current.isoformat()
+            if is_holiday(current_str):
+                holiday_dates.add(current_str)
+            current += timedelta(days=1)
+
+    eligible_dates = []
+    current = date.fromisoformat(active_start)
+    end = date.fromisoformat(active_end)
+    while current <= end:
+        current_str = current.isoformat()
+        is_sunday_off = current.weekday() == 6 and current_str not in sunday_work_dates
+        if (
+            not is_sunday_off
+            and current_str not in holiday_dates
+            and current_str not in leave_dates
+            and not _employee_inactive_on_date(emp, current_str)
+        ):
+            eligible_dates.append(current_str)
+        current += timedelta(days=1)
+    return eligible_dates
+
+
+def _attendance_summary_for_period(emp_id, emp, records, period_start, period_end, as_of_date=None):
+    """Calculate attendance counts and percentage using one system-wide rule."""
+    eligible_dates = _eligible_attendance_dates(
+        emp_id,
+        emp,
+        period_start,
+        period_end,
+        as_of_date=as_of_date,
+    )
+    eligible_set = set(eligible_dates)
+    eligible_records = [
+        record for record in records
+        if str(record.get("date", "")) in eligible_set
+    ]
+
+    missed_checkout = sum(1 for record in eligible_records if is_missed_checkout(record))
+    present = sum(
+        1 for record in eligible_records
+        if record.get("status") == "Present" and not is_missed_checkout(record)
+    )
+    late = sum(
+        1 for record in eligible_records
+        if record.get("status") == "Late" and not is_missed_checkout(record)
+    )
+    half_day = sum(1 for record in eligible_records if record.get("status") == "Half-Day")
+    absent = sum(1 for record in eligible_records if record.get("status") == "Absent")
+    recorded_dates = {
+        str(record.get("date"))
+        for record in eligible_records
+        if record.get("date")
+    }
+    eligible_days = len(eligible_dates)
+    not_marked = max(eligible_days - len(recorded_dates), 0)
+    working_credit = present + late + (half_day * 0.5)
+    attendance_percentage = round(
+        (working_credit / eligible_days) * 100,
+        2,
+    ) if eligible_days else 0
+
+    return {
+        "eligible_days": eligible_days,
+        "recorded_days": len(recorded_dates),
+        "not_marked": not_marked,
+        "present": present,
+        "late": late,
+        "half_day": half_day,
+        "absent": absent,
+        "missed_checkout": missed_checkout,
+        "attendance_percentage": attendance_percentage,
+        "records": eligible_records,
+    }
+
+
+def resolve_daily_report_status(attendance_record=None, approved_leave=False, paid_holiday=False):
+    """Resolve the displayed daily status without exposing stale holiday records."""
+    record = attendance_record or {}
+    if paid_holiday:
+        return "Paid Holiday", {}
+    if approved_leave:
+        return "Approved Leave", {}
+    return record.get("status", "Not Marked"), record
+
 
 # ------------------------------------------------------------------------------------------------------------------------------------------
 # STATUS CALCULATION
@@ -381,6 +607,10 @@ def mark_arrival(emp_id, arrival_time=None, manual_override=False, query_date=No
     #        always gets the correct message regardless of their shift window.
     if is_holiday(today):
         return False, _holiday_block_message(today)
+
+    sunday_block = _sunday_off_block_message(emp_id, today)
+    if sunday_block:
+        return False, sunday_block
 
     leave_block = _approved_leave_block_message(emp, today)
     if leave_block:
@@ -547,6 +777,10 @@ def mark_checkout(emp_id, checkout_time=None, manual_override=False, query_date=
     if is_holiday(today):
         return False, _holiday_block_message(today)
 
+    sunday_block = _sunday_off_block_message(emp_id, today)
+    if sunday_block:
+        return False, sunday_block
+
     leave_block = _approved_leave_block_message(emp, today)
     if leave_block:
         return False, leave_block
@@ -570,20 +804,36 @@ def mark_checkout(emp_id, checkout_time=None, manual_override=False, query_date=
     except ValueError:
         return False, "Invalid time format in records!"
 
-    if chk_dt < arr_dt:
-        from datetime import timedelta
-        chk_dt += timedelta(days=1)          # Night shift: checkout next morning
+    try:
+        from shift_model import calculate_work_session_hours, MAX_WORK_SESSION_HOURS
+        hours_worked = calculate_work_session_hours(arrival_str, checkout_time)
+    except ImportError:
+        if chk_dt < arr_dt:
+            chk_dt += timedelta(days=1)
+        hours_worked = round((chk_dt - arr_dt).total_seconds() / 3600, 2)
+        MAX_WORK_SESSION_HOURS = 12
 
-    hours_worked = round((chk_dt - arr_dt).total_seconds() / 3600, 2)
-    if hours_worked < 0:
-        return False, "Checkout cannot be before arrival!"
+    if hours_worked is None or hours_worked > MAX_WORK_SESSION_HOURS:
+        return False, (
+            f"Checkout rejected: work duration must not exceed "
+            f"{MAX_WORK_SESSION_HOURS} hours. Check the arrival and checkout times."
+        )
 
     # ------ Shift-aware overtime ------------------------------------------------------------------------------------------------------------------------------------------------------
     overtime_hours = 0.0
     metrics = None
     try:
         from shift_model import calculate_shift_metrics, SHIFTS, get_employee_shift
-        metrics = calculate_shift_metrics(emp_id, arrival_str, checkout_time)
+        record_shift = record.get("shift")
+        if record_shift not in SHIFTS:
+            record_shift = get_employee_shift(emp_id, today)
+        metrics = calculate_shift_metrics(
+            emp_id,
+            arrival_str,
+            checkout_time,
+            shift_name=record_shift,
+            work_date=today,
+        )
         if metrics:
             overtime_hours = metrics["overtime_hours"]
     except ImportError:
@@ -592,7 +842,9 @@ def mark_checkout(emp_id, checkout_time=None, manual_override=False, query_date=
 
     # ------ Recalculate status based on actual hours worked ---------------------------------------------------------------------
     try:
-        shift_name  = get_employee_shift(emp_id) or emp.get("shift")
+        shift_name = record.get("shift")
+        if shift_name not in SHIFTS:
+            shift_name = get_employee_shift(emp_id, today) or emp.get("shift")
         shift_hours = SHIFTS[shift_name]["hours"] if shift_name in SHIFTS else FULLDAY_HOURS
     except Exception:
         shift_hours = FULLDAY_HOURS
@@ -653,6 +905,10 @@ def mark_absent(emp_id, query_date=None):
     if is_holiday(today):
         return False, _holiday_block_message(today)
 
+    sunday_block = _sunday_off_block_message(emp_id, today)
+    if sunday_block:
+        return False, sunday_block
+
     leave_block = _approved_leave_block_message(emp, today)
     if leave_block:
         return False, leave_block
@@ -710,12 +966,60 @@ def _completed_shift_work_date(shift_name, now=None):
     return work_date.isoformat(), end_dt
 
 
+def _completed_shift_work_dates(shift_name, start_date, now=None):
+    """Return every work date from start_date through the latest completed shift."""
+    completed = _completed_shift_work_date(shift_name, now)
+    if not completed:
+        return []
+    latest_work_date, _ = completed
+    start_date = _as_date_string(start_date)
+    if not start_date or start_date > latest_work_date:
+        return []
+
+    current = date.fromisoformat(start_date)
+    end = date.fromisoformat(latest_work_date)
+    work_dates = []
+    while current <= end:
+        work_dates.append(current.isoformat())
+        current += timedelta(days=1)
+    return work_dates
+
+
+def _next_date(date_string):
+    parsed = _as_date_string(date_string)
+    if not parsed:
+        return None
+    return (date.fromisoformat(parsed) + timedelta(days=1)).isoformat()
+
+
+def _initial_auto_absence_start(emp, latest_completed_work_date):
+    """
+    Establish a safe first checkpoint after upgrading from the old scheduler.
+    Resume after the employee's latest active attendance record. Employees with
+    no history start at the latest completed date to avoid inventing old data.
+    """
+    latest_record = attendance_col.find_one(
+        {"emp_id": emp.get("emp_id"), "deleted": {"$ne": True}},
+        {"date": 1},
+        sort=[("date", -1)],
+    )
+    latest_record_date = _as_date_string((latest_record or {}).get("date"))
+    if latest_record_date:
+        return _next_date(latest_record_date)
+
+    joining_date = _employee_joining_date(emp)
+    if joining_date == latest_completed_work_date:
+        return joining_date
+    return latest_completed_work_date
+
+
 def auto_mark_absent_for_today(shift_name=None):
     """
-    Marks absent only for employees whose own shift has already ended.
-    If shift_name is supplied, only that shift is processed. Otherwise all
-    shifts are checked, but each employee is still evaluated against their
-    assigned shift and completed work date.
+    Marks absent for every unprocessed, completed work date.
+
+    Progress is stored per shift so startup catch-up covers multi-day downtime.
+    Existing attendance, holidays, Sunday holidays, approved leave, and dates
+    outside an employee's active employment period are always skipped.
     """
     try:
         from shift_model import get_employee_shift, SHIFTS
@@ -723,42 +1027,83 @@ def auto_mark_absent_for_today(shift_name=None):
         return False, "Shift module not available. Auto absent was not run."
 
     now = _trusted_now()
-    employees = employees_col.find({"role": "employee", "deleted": {"$ne": True}})
+    employees = list(employees_col.find({"role": "employee", "deleted": {"$ne": True}}))
     absent_marked = []
 
     if shift_name and shift_name not in SHIFTS:
         return False, f"Invalid shift: {shift_name}"
 
-    for emp in employees:
-        eid = emp["emp_id"]
-        emp_shift = get_employee_shift(eid) or emp.get("shift")
-        if emp_shift not in SHIFTS:
-            continue
-        if shift_name and emp_shift != shift_name:
-            continue
-
-        completed = _completed_shift_work_date(emp_shift, now)
+    shifts_to_process = [shift_name] if shift_name else list(SHIFTS)
+    for current_shift in shifts_to_process:
+        completed = _completed_shift_work_date(current_shift, now)
         if not completed:
             continue
-        work_date, shift_end_dt = completed
+        latest_work_date, shift_end_dt = completed
         if now < shift_end_dt:
             continue
-        if not _employee_overlaps_period(emp, work_date, work_date):
-            continue
-        if is_holiday(work_date):
-            continue
-        if get_approved_leave_for_date(eid, work_date):
-            continue
 
-        existing = attendance_col.find_one({
-            "emp_id": eid,
-            "date": work_date,
-        })
-        if existing:
-            if existing.get("deleted"):
-                attendance_col.update_one(
-                    {"emp_id": eid, "date": work_date},
-                    {"$set": {
+        state = auto_absence_state_col.find_one({"shift": current_shift}) or {}
+        checkpoint_start = _next_date(state.get("last_processed_work_date"))
+
+        for emp in employees:
+            eid = emp["emp_id"]
+            start_date = checkpoint_start or _initial_auto_absence_start(
+                emp,
+                latest_work_date,
+            )
+            for work_date in _completed_shift_work_dates(
+                current_shift,
+                start_date,
+                now,
+            ):
+                emp_shift = get_employee_shift(eid, work_date) or emp.get("shift")
+                if emp_shift != current_shift:
+                    continue
+                if not _employee_overlaps_period(emp, work_date, work_date):
+                    continue
+                if is_holiday(work_date):
+                    continue
+                if _sunday_off_block_message(eid, work_date):
+                    continue
+                if get_approved_leave_for_date(eid, work_date):
+                    continue
+
+                existing = attendance_col.find_one({
+                    "emp_id": eid,
+                    "date": work_date,
+                })
+                if existing:
+                    if existing.get("deleted"):
+                        attendance_col.update_one(
+                            {"emp_id": eid, "date": work_date},
+                            {"$set": {
+                                "emp_id":         eid,
+                                "name":           emp["name"],
+                                "department":     emp.get("department", "N/A"),
+                                "date":           work_date,
+                                "status":         "Absent",
+                                "arrival_time":   None,
+                                "checkout_time":  None,
+                                "late_minutes":   0,
+                                "hours_worked":   0,
+                                "overtime_hours": 0,
+                                "shift":          emp_shift,
+                                "marked_at":      _now_stamp(),
+                                "marked_by":      "system",
+                                "auto_marked":    True,
+                                "auto_reason":    "No check-in recorded after shift end",
+                            },
+                            "$unset": {
+                                "deleted": "",
+                                "deleted_at": "",
+                                "deleted_by": "",
+                            }}
+                        )
+                        absent_marked.append(f"{emp['name']} ({emp_shift}, {work_date})")
+                    continue
+
+                try:
+                    attendance_col.insert_one({
                         "emp_id":         eid,
                         "name":           emp["name"],
                         "department":     emp.get("department", "N/A"),
@@ -774,37 +1119,20 @@ def auto_mark_absent_for_today(shift_name=None):
                         "marked_by":      "system",
                         "auto_marked":    True,
                         "auto_reason":    "No check-in recorded after shift end",
-                    },
-                    "$unset": {
-                        "deleted": "",
-                        "deleted_at": "",
-                        "deleted_by": "",
-                    }}
-                )
+                    })
+                except DuplicateKeyError:
+                    continue
                 absent_marked.append(f"{emp['name']} ({emp_shift}, {work_date})")
-            continue
 
-        try:
-            attendance_col.insert_one({
-                "emp_id":         eid,
-                "name":           emp["name"],
-                "department":     emp.get("department", "N/A"),
-                "date":           work_date,
-                "status":         "Absent",
-                "arrival_time":   None,
-                "checkout_time":  None,
-                "late_minutes":   0,
-                "hours_worked":   0,
-                "overtime_hours": 0,
-                "shift":          emp_shift,
-                "marked_at":      _now_stamp(),
-                "marked_by":      "system",
-                "auto_marked":    True,
-                "auto_reason":    "No check-in recorded after shift end",
-            })
-        except DuplicateKeyError:
-            continue
-        absent_marked.append(f"{emp['name']} ({emp_shift}, {work_date})")
+        auto_absence_state_col.update_one(
+            {"shift": current_shift},
+            {"$set": {
+                "shift": current_shift,
+                "last_processed_work_date": latest_work_date,
+                "updated_at": _now_stamp(),
+            }},
+            upsert=True,
+        )
 
     return True, absent_marked
 
@@ -847,7 +1175,11 @@ def get_attendance_by_date(query_date=None):
                 "status": {"$in": ["Approved", "Revert Requested"]},
                 "$or": [
                     {"working_dates": query_date},
-                    {"from_date": {"$lte": query_date}, "to_date": {"$gte": query_date}},
+                    {
+                        "working_dates": {"$exists": False},
+                        "from_date": {"$lte": query_date},
+                        "to_date": {"$gte": query_date},
+                    },
                 ],
             },
             {"emp_id": 1}
@@ -865,7 +1197,9 @@ def get_attendance_by_employee(emp_id):
     emp_id, err = _resolve_emp_id(emp_id)
     if err:
         return []
-    emp = employees_col.find_one({"emp_id": emp_id, "deleted": {"$ne": True}}, {"password": 0})
+    emp = employees_col.find_one({"emp_id": emp_id}, {"password": 0})
+    if emp and not employee_active_during_period(emp, month_start, month_end):
+        emp = None
     if not emp:
         return []
     records = list(
@@ -899,45 +1233,37 @@ def get_monthly_report(emp_id, month, year):
     month_start = f"{prefix}-01"
     month_end = f"{prefix}-{calendar.monthrange(int(year), int(month))[1]:02d}"
     emp = employees_col.find_one({"emp_id": emp_id, "deleted": {"$ne": True}}, {"password": 0})
-    if not emp:
-        records = []
-    else:
-        active_period = _employee_active_period(emp, month_start, month_end)
-        if active_period:
-            active_start, active_end = active_period
-            records = list(
-                attendance_col.find({
-                    "emp_id": emp_id,
-                    "date":   {"$gte": active_start, "$lte": active_end},
-                    "deleted": {"$ne": True}
-                }, {"_id": 0})
-            )
-        else:
-            records = []
-    leave_dates = get_approved_leave_dates_for_month(emp_id, prefix)
-    records = [r for r in records if r.get("date") not in leave_dates]
-
-    total_present = sum(1 for r in records if r.get("status") == "Present")
-    total_late    = sum(1 for r in records if r.get("status") == "Late")
-    total_halfday = sum(1 for r in records if r.get("status") == "Half-Day")
-    total_absent  = sum(1 for r in records if r.get("status") == "Absent")
-    total_days    = len(records)
-
-    working_credit = total_present + total_late + (total_halfday * 0.5)
-    attendance_percent = round(
-        (working_credit / total_days) * 100, 2
-    ) if total_days else 0
+    records = list(attendance_col.find({
+        "emp_id": emp_id,
+        "date": {"$gte": month_start, "$lte": month_end},
+        "deleted": {"$ne": True},
+    }, {"_id": 0})) if emp else []
+    summary = _attendance_summary_for_period(
+        emp_id,
+        emp,
+        records,
+        month_start,
+        month_end,
+    ) if emp else {
+        "eligible_days": 0, "recorded_days": 0, "not_marked": 0,
+        "present": 0, "late": 0, "half_day": 0, "absent": 0,
+        "missed_checkout": 0, "attendance_percentage": 0,
+    }
 
     return {
         "emp_id":                emp_id,
         "month":                 month,
         "year":                  year,
-        "total_days":            total_days,
-        "present":               total_present,
-        "late":                  total_late,
-        "half_day":              total_halfday,
-        "absent":                total_absent,
-        "attendance_percentage": attendance_percent
+        "total_days":            summary["eligible_days"],
+        "eligible_days":         summary["eligible_days"],
+        "recorded_days":         summary["recorded_days"],
+        "not_marked":            summary["not_marked"],
+        "present":               summary["present"],
+        "late":                  summary["late"],
+        "half_day":              summary["half_day"],
+        "absent":                summary["absent"],
+        "missed_checkout":       summary["missed_checkout"],
+        "attendance_percentage": summary["attendance_percentage"],
     }
 
 
@@ -959,8 +1285,11 @@ def get_monthly_attendance_report(month, year):
     month_start = f"{prefix}-01"
     month_end = f"{prefix}-{month_days:02d}"
     employees = [
-        emp for emp in employees_col.find({"role": "employee", "deleted": {"$ne": True}}, {"_id": 0, "password": 0}).sort("emp_id", 1)
-        if _employee_overlaps_period(emp, month_start, month_end)
+        emp for emp in employees_col.find(
+            {"role": "employee"},
+            {"_id": 0, "password": 0},
+        ).sort("emp_id", 1)
+        if employee_active_during_period(emp, month_start, month_end)
     ]
 
     records = list(attendance_col.find(
@@ -979,29 +1308,20 @@ def get_monthly_attendance_report(month, year):
         if not active_period:
             continue
         active_start, active_end = active_period
-        leave_dates = get_approved_leave_dates_for_month(emp_id, prefix)
         emp_records = [
             r for r in by_emp.get(emp_id, [])
             if active_start <= str(r.get("date", "")) <= active_end
-            and r.get("date") not in leave_dates
         ]
-
-        missed_checkout = sum(1 for r in emp_records if is_missed_checkout(r))
-        present = sum(1 for r in emp_records if r.get("status") == "Present") - sum(
-            1 for r in emp_records
-            if r.get("status") == "Present" and is_missed_checkout(r)
+        summary = _attendance_summary_for_period(
+            emp_id,
+            emp,
+            emp_records,
+            month_start,
+            month_end,
         )
-        late = sum(1 for r in emp_records if r.get("status") == "Late") - sum(
-            1 for r in emp_records
-            if r.get("status") == "Late" and is_missed_checkout(r)
-        )
-        half_day = sum(1 for r in emp_records if r.get("status") == "Half-Day")
-        absent = sum(1 for r in emp_records if r.get("status") == "Absent")
-        recorded_days = len(emp_records)
-        working_credit = present + late + (half_day * 0.5)
-        attendance_percentage = round((working_credit / recorded_days) * 100, 2) if recorded_days else 0
+        eligible_records = summary["records"]
 
-        total_late_minutes = sum(int(r.get("late_minutes") or 0) for r in emp_records)
+        total_late_minutes = sum(int(r.get("late_minutes") or 0) for r in eligible_records)
 
         report.append({
             "emp_id": emp_id,
@@ -1009,17 +1329,19 @@ def get_monthly_attendance_report(month, year):
             "department": emp.get("department", "N/A"),
             "month": prefix,
             "month_days": month_days,
-            "recorded_days": recorded_days,
-            "present": present,
-            "late": late,
-            "half_day": half_day,
-            "absent": absent,
-            "missed_checkout": missed_checkout,
+            "eligible_days": summary["eligible_days"],
+            "recorded_days": summary["recorded_days"],
+            "not_marked": summary["not_marked"],
+            "present": summary["present"],
+            "late": summary["late"],
+            "half_day": summary["half_day"],
+            "absent": summary["absent"],
+            "missed_checkout": summary["missed_checkout"],
             "total_late_minutes": total_late_minutes,
             "total_late_hours": round(total_late_minutes / 60, 2),
-            "total_hours_worked": round(sum(float(r.get("hours_worked") or 0) for r in emp_records), 2),
-            "total_overtime_hours": round(sum(float(r.get("overtime_hours") or 0) for r in emp_records), 2),
-            "attendance_percentage": attendance_percentage,
+            "total_hours_worked": round(sum(float(r.get("hours_worked") or 0) for r in eligible_records), 2),
+            "total_overtime_hours": round(sum(float(r.get("overtime_hours") or 0) for r in eligible_records), 2),
+            "attendance_percentage": summary["attendance_percentage"],
         })
 
     return report
@@ -1028,7 +1350,7 @@ def get_monthly_attendance_report(month, year):
 def get_employee_monthly_attendance_percentage(emp_id, month=None, year=None):
     """
     Returns attendance percentage for employee list display.
-    Uses full calendar month days as denominator, separate from Monthly Attendance report.
+    Uses the same elapsed eligible-working-day rule as the monthly report.
     """
     try:
         emp_id = int(emp_id)
@@ -1049,25 +1371,18 @@ def get_employee_monthly_attendance_percentage(emp_id, month=None, year=None):
     if not active_period:
         return 0
     active_start, active_end = active_period
-    active_days = (date.fromisoformat(active_end) - date.fromisoformat(active_start)).days + 1
     records = list(attendance_col.find(
         {"emp_id": emp_id, "date": {"$gte": active_start, "$lte": active_end}, "deleted": {"$ne": True}},
         {"_id": 0}
     ))
-    leave_dates = get_approved_leave_dates_for_month(emp_id, prefix)
-    records = [r for r in records if r.get("date") not in leave_dates]
-
-    present = sum(
-        1 for r in records
-        if r.get("status") == "Present" and not is_missed_checkout(r)
+    summary = _attendance_summary_for_period(
+        emp_id,
+        emp,
+        records,
+        month_start,
+        month_end,
     )
-    late = sum(
-        1 for r in records
-        if r.get("status") == "Late" and not is_missed_checkout(r)
-    )
-    half_day = sum(1 for r in records if r.get("status") == "Half-Day")
-    working_credit = present + late + (half_day * 0.5)
-    return round((working_credit / active_days) * 100, 2) if active_days else 0
+    return summary["attendance_percentage"]
 
 
 # ------------------------------------------------------------------------------------------------------------------------------------------
@@ -1108,6 +1423,11 @@ def mark_all_present_today():
 
         if is_holiday(work_date):
             wrong_shift.append(f"{emp['name']} ({_holiday_block_message(work_date)})")
+            continue
+
+        sunday_block = _sunday_off_block_message(eid, work_date)
+        if sunday_block:
+            wrong_shift.append(f"{emp['name']} (Sunday holiday)")
             continue
 
         # Already has a record for this shift work date --- skip
@@ -1162,29 +1482,3 @@ def mark_all_present_today():
 
     return True, marked, skipped, wrong_shift
 
-# ------------------------------------------------------------------------------------------------------------------------------------------
-# DELETE ATTENDANCE (admin only)
-# ------------------------------------------------------------------------------------------------------------------------------------------
-def delete_attendance(emp_id, query_date=None, deleted_by=None):
-    emp_id, err = _resolve_emp_id(emp_id)
-    if err:
-        return False, err
-    query_date = query_date or _today()
-    result = attendance_col.update_one(
-        {"emp_id": emp_id, "date": query_date, "deleted": {"$ne": True}},
-        {"$set": {
-            "deleted": True,
-            "deleted_at": _now_stamp(),
-            "deleted_by": str(deleted_by or "admin"),
-        }}
-    )
-
-    if result.modified_count:
-        log_action(
-            action       = "DELETE_ATTENDANCE",
-            performed_by = str(deleted_by or "admin"),
-            target       = str(emp_id),
-            details      = f"Attendance record for {query_date} soft-deleted for Emp ID {emp_id} by {deleted_by or 'admin'}.",
-        )
-        return True, f"Attendance soft-deleted for Emp ID {emp_id}"
-    return False, "No active attendance record found!"
