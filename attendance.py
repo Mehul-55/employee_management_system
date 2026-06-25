@@ -408,7 +408,64 @@ def get_approved_leave_dates_for_month(emp_id, year_month):
     return dates
 
 
-def _eligible_attendance_dates(emp_id, emp, period_start, period_end, as_of_date=None):
+def _approved_leave_dates_map(emp_ids, month_start, month_end):
+    try:
+        emp_ids = [int(emp_id) for emp_id in emp_ids]
+    except Exception:
+        emp_ids = []
+    if not emp_ids:
+        return {}
+
+    docs = leave_requests_col.find(
+        {
+            "emp_id": {"$in": emp_ids},
+            "status": {"$in": ["Approved", "Revert Requested"]},
+            "$or": [
+                {"working_dates": {"$elemMatch": {"$gte": month_start, "$lte": month_end}}},
+                {
+                    "working_dates": {"$exists": False},
+                    "from_date": {"$lte": month_end},
+                    "to_date": {"$gte": month_start},
+                },
+            ],
+        },
+        {"_id": 0, "emp_id": 1, "working_dates": 1, "from_date": 1, "to_date": 1},
+    )
+
+    result = {emp_id: set() for emp_id in emp_ids}
+    for doc in docs:
+        emp_id = doc.get("emp_id")
+        if emp_id not in result:
+            continue
+        if "working_dates" in doc:
+            result[emp_id].update(
+                str(day) for day in (doc.get("working_dates") or [])
+                if month_start <= str(day) <= month_end
+            )
+            continue
+        try:
+            current = date.fromisoformat(doc.get("from_date"))
+            end = date.fromisoformat(doc.get("to_date"))
+        except (TypeError, ValueError):
+            continue
+        while current <= end:
+            current_str = current.isoformat()
+            if month_start <= current_str <= month_end:
+                result[emp_id].add(current_str)
+            current += timedelta(days=1)
+    return result
+
+
+def _eligible_attendance_dates(
+    emp_id,
+    emp,
+    period_start,
+    period_end,
+    as_of_date=None,
+    leave_dates=None,
+    holiday_dates=None,
+    sunday_work_dates=None,
+):
     """
     Return elapsed working dates used as the attendance percentage denominator.
 
@@ -425,33 +482,46 @@ def _eligible_attendance_dates(emp_id, emp, period_start, period_end, as_of_date
     if active_start > active_end:
         return []
 
-    leave_dates = get_approved_leave_dates_for_month(
-        emp_id,
-        active_start[:7],
-    )
-    if active_start[:7] != active_end[:7]:
-        leave_dates.update(
-            get_approved_leave_dates_for_month(emp_id, active_end[:7])
-        )
-
-    try:
-        from shift_model import (
-            get_holidays_for_range,
-            get_sunday_work_approval_dates_for_range,
-        )
-        holiday_dates = {
-            str(item.get("_holiday_date"))
-            for item in get_holidays_for_range(active_start, active_end)
-            if item.get("_holiday_date")
-        }
-        sunday_work_dates = get_sunday_work_approval_dates_for_range(
+    if leave_dates is None:
+        leave_dates = get_approved_leave_dates_for_month(
             emp_id,
-            active_start,
-            active_end,
+            active_start[:7],
         )
-    except Exception:
+        if active_start[:7] != active_end[:7]:
+            leave_dates.update(
+                get_approved_leave_dates_for_month(emp_id, active_end[:7])
+            )
+    needs_holiday_fallback = False
+    if holiday_dates is None or sunday_work_dates is None:
+        try:
+            from shift_model import (
+                get_holidays_for_range,
+                get_sunday_work_approval_dates_for_range,
+            )
+            if holiday_dates is None:
+                holiday_dates = {
+                    str(item.get("_holiday_date"))
+                    for item in get_holidays_for_range(active_start, active_end)
+                    if item.get("_holiday_date")
+                }
+            if sunday_work_dates is None:
+                sunday_work_dates = get_sunday_work_approval_dates_for_range(
+                    emp_id,
+                    active_start,
+                    active_end,
+                )
+        except Exception:
+            needs_holiday_fallback = holiday_dates is None
+            holiday_dates = set() if holiday_dates is None else holiday_dates
+            sunday_work_dates = set() if sunday_work_dates is None else sunday_work_dates
+    if not holiday_dates:
         holiday_dates = set()
+    if not sunday_work_dates:
         sunday_work_dates = set()
+    if not leave_dates:
+        leave_dates = set()
+
+    if needs_holiday_fallback:
         current = date.fromisoformat(active_start)
         end = date.fromisoformat(active_end)
         while current <= end:
@@ -477,7 +547,17 @@ def _eligible_attendance_dates(emp_id, emp, period_start, period_end, as_of_date
     return eligible_dates
 
 
-def _attendance_summary_for_period(emp_id, emp, records, period_start, period_end, as_of_date=None):
+def _attendance_summary_for_period(
+    emp_id,
+    emp,
+    records,
+    period_start,
+    period_end,
+    as_of_date=None,
+    leave_dates=None,
+    holiday_dates=None,
+    sunday_work_dates=None,
+):
     """Calculate attendance counts and percentage using one system-wide rule."""
     eligible_dates = _eligible_attendance_dates(
         emp_id,
@@ -485,6 +565,9 @@ def _attendance_summary_for_period(emp_id, emp, records, period_start, period_en
         period_start,
         period_end,
         as_of_date=as_of_date,
+        leave_dates=leave_dates,
+        holiday_dates=holiday_dates,
+        sunday_work_dates=sunday_work_dates,
     )
     eligible_set = set(eligible_dates)
     eligible_records = [
@@ -1187,7 +1270,23 @@ def get_attendance_by_date(query_date=None):
     }
     visible_emp_ids = [emp_id for emp_id in active_emp_ids if emp_id not in leave_emp_ids]
     return list(
-        attendance_col.find({"date": query_date, "emp_id": {"$in": visible_emp_ids}, "deleted": {"$ne": True}}, {"_id": 0})
+        attendance_col.find(
+            {"date": query_date, "emp_id": {"$in": visible_emp_ids}, "deleted": {"$ne": True}},
+            {
+                "_id": 0,
+                "emp_id": 1,
+                "name": 1,
+                "department": 1,
+                "status": 1,
+                "arrival_time": 1,
+                "checkin_time": 1,
+                "checkout_time": 1,
+                "hours_worked": 1,
+                "late_minutes": 1,
+                "shift": 1,
+                "shift_name": 1,
+            },
+        )
     )
 
 # ------------------------------------------------------------------------------------------------------------------------------------------
@@ -1287,19 +1386,59 @@ def get_monthly_attendance_report(month, year):
     employees = [
         emp for emp in employees_col.find(
             {"role": "employee"},
-            {"_id": 0, "password": 0},
+            {
+                "_id": 0,
+                "emp_id": 1,
+                "name": 1,
+                "department": 1,
+                "joining_date": 1,
+                "created_at": 1,
+                "deleted": 1,
+                "deleted_at": 1,
+                "resignation_date": 1,
+                "leaving_date": 1,
+                "date_of_leaving": 1,
+                "termination_date": 1,
+            },
         ).sort("emp_id", 1)
         if employee_active_during_period(emp, month_start, month_end)
     ]
+    emp_ids = [emp.get("emp_id") for emp in employees if emp.get("emp_id") is not None]
 
     records = list(attendance_col.find(
         {"date": {"$gte": month_start, "$lte": month_end}, "deleted": {"$ne": True}},
-        {"_id": 0}
+        {
+            "_id": 0,
+            "emp_id": 1,
+            "date": 1,
+            "status": 1,
+            "arrival_time": 1,
+            "checkin_time": 1,
+            "shift": 1,
+            "shift_name": 1,
+            "late_minutes": 1,
+            "hours_worked": 1,
+            "overtime_hours": 1,
+            "checkout_time": 1,
+        }
     ))
 
     by_emp = {}
     for record in records:
         by_emp.setdefault(record.get("emp_id"), []).append(record)
+
+    leave_dates_by_emp = _approved_leave_dates_map(emp_ids, month_start, month_end)
+    try:
+        from shift_model import get_holidays_for_range, get_sunday_work_approval_map
+        holiday_dates = {
+            str(item.get("_holiday_date"))
+            for item in get_holidays_for_range(month_start, month_end)
+            if item.get("_holiday_date")
+        }
+        sunday_work_by_emp = get_sunday_work_approval_map(emp_ids, month_start, month_end)
+    except Exception:
+        holiday_dates = None
+        sunday_work_by_emp = {}
 
     report = []
     for emp in employees:
@@ -1318,6 +1457,9 @@ def get_monthly_attendance_report(month, year):
             emp_records,
             month_start,
             month_end,
+            leave_dates=leave_dates_by_emp.get(emp_id, set()),
+            holiday_dates=holiday_dates,
+            sunday_work_dates=sunday_work_by_emp.get(emp_id, set()),
         )
         eligible_records = summary["records"]
 

@@ -124,14 +124,14 @@ def _login_lock_message(locked_until):
 def _check_login_lock(login_type, identifier):
     identifier = _login_identifier(login_type, identifier)
     if not identifier:
-        return False, None
+        return False, None, False
     record = login_attempts_col.find_one({"login_type": login_type, "identifier": identifier})
     if not record:
-        return False, None
+        return False, None, False
     locked_until = record.get("locked_until")
     if isinstance(locked_until, datetime) and locked_until > _app_trusted_now():
-        return True, _login_lock_message(locked_until)
-    return False, None
+        return True, _login_lock_message(locked_until), True
+    return False, None, True
 
 
 def _record_login_failure(login_type, identifier):
@@ -217,7 +217,7 @@ def admin_login(username, password):
     if not username or not password:
         return False, None, "Username and Password cannot be empty!"
 
-    locked, lock_msg = _check_login_lock("admin", username)
+    locked, lock_msg, had_failed_attempts = _check_login_lock("admin", username)
     if locked:
         return False, None, lock_msg
 
@@ -232,7 +232,8 @@ def admin_login(username, password):
             "Check your .env file."
         )
     if _verify_password(ADMIN_PASSWORD_HASH, password):
-        _clear_login_failures("admin", username)
+        if had_failed_attempts:
+            _clear_login_failures("admin", username)
         return True, "admin", "Admin"
     _record_login_failure("admin", username)
     return False, None, "Invalid admin credentials!"
@@ -254,11 +255,14 @@ def employee_login(emp_id, password):
     if not password:
         return False, None, "Password cannot be empty!"
 
-    locked, lock_msg = _check_login_lock("employee", emp_id)
+    locked, lock_msg, had_failed_attempts = _check_login_lock("employee", emp_id)
     if locked:
         return False, None, lock_msg
 
-    user = employees_col.find_one({"emp_id": emp_id})
+    user = employees_col.find_one(
+        {"emp_id": emp_id},
+        {"emp_id": 1, "name": 1, "password": 1, "deleted": 1},
+    )
     if not user:
         _record_login_failure("employee", emp_id)
         return False, None, f"No account found for Employee ID {emp_id}!"
@@ -282,7 +286,8 @@ def employee_login(emp_id, password):
             {"$set": {"password": _hash_password(password)}}
         )
 
-    _clear_login_failures("employee", emp_id)
+    if had_failed_attempts:
+        _clear_login_failures("employee", emp_id)
     return True, emp_id, user["name"]
 
 
@@ -370,6 +375,88 @@ def register_employee(
     employees_col.insert_one(doc)
 
     return True, f"✅ Employee {name} (ID: {emp_id}) registered successfully!"
+
+
+def update_employee_details(
+    emp_id, name, basic_salary=0, department=None,
+    email=None, phone=None, address=None, joining_date=None,
+):
+    """Updates editable employee profile fields without changing password."""
+    import re
+
+    try:
+        emp_id = int(emp_id)
+    except (ValueError, TypeError):
+        return False, "Employee ID must be a number!"
+
+    if not name or not name.strip():
+        return False, "Name cannot be empty!"
+    if not department:
+        return False, "Department is required!"
+    valid_departments = get_departments(include_fallback=False)
+    if valid_departments and department not in valid_departments:
+        return False, "Please select a valid department from the list!"
+
+    try:
+        basic_salary = float(basic_salary)
+        if basic_salary < 0:
+            return False, "Basic salary cannot be negative!"
+    except (ValueError, TypeError):
+        return False, "Basic salary must be a valid number!"
+
+    try:
+        joining_date = _normalize_joining_date(joining_date)
+    except ValueError as exc:
+        return False, str(exc)
+
+    emp = employees_col.find_one({"emp_id": emp_id, "deleted": {"$ne": True}})
+    if not emp:
+        return False, f"No active employee found with ID {emp_id}!"
+
+    normalized_email = email.strip().lower() if email and email.strip() else ""
+    if normalized_email:
+        if not re.fullmatch(r"[^@\s]+@[^@\s]+\.[^@\s]+", normalized_email):
+            return False, "Email address is invalid."
+        duplicate = employees_col.find_one({
+            "emp_id": {"$ne": emp_id},
+            "email": normalized_email,
+            "deleted": {"$ne": True},
+        })
+        if duplicate:
+            return False, f"Email '{normalized_email}' is already registered to another employee!"
+
+    if phone and phone.strip():
+        if not re.fullmatch(r"[\d\s\-\+]{7,15}", phone.strip()):
+            return False, "Phone number is invalid (7-15 digits; spaces, dashes or + allowed)."
+
+    set_fields = {
+        "name": name.strip(),
+        "department": department,
+        "basic_salary": basic_salary,
+        "joining_date": joining_date,
+        "updated_at": _app_now_stamp(),
+    }
+    unset_fields = {"salary": ""}
+
+    if normalized_email:
+        set_fields["email"] = normalized_email
+    else:
+        unset_fields["email"] = ""
+    if phone and phone.strip():
+        set_fields["phone"] = phone.strip()
+    else:
+        unset_fields["phone"] = ""
+    if address and address.strip():
+        set_fields["address"] = address.strip()
+    else:
+        unset_fields["address"] = ""
+
+    update_doc = {"$set": set_fields}
+    if unset_fields:
+        update_doc["$unset"] = unset_fields
+
+    employees_col.update_one({"emp_id": emp_id, "deleted": {"$ne": True}}, update_doc)
+    return True, f"Employee ID {emp_id} updated successfully!"
 
 
 # ══════════════════════════════════════════════
@@ -717,7 +804,25 @@ def get_all_employees(include_deleted=False):
     if not include_deleted:
         query["deleted"] = {"$ne": True}
 
-    docs = employees_col.find(query, {"_id": 0, "password": 0}).sort("emp_id", 1)
+    docs = employees_col.find(
+        query,
+        {
+            "_id": 0,
+            "emp_id": 1,
+            "name": 1,
+            "role": 1,
+            "department": 1,
+            "basic_salary": 1,
+            "salary": 1,
+            "email": 1,
+            "phone": 1,
+            "address": 1,
+            "deleted": 1,
+            "deleted_at": 1,
+            "joining_date": 1,
+            "created_at": 1,
+        },
+    ).sort("emp_id", 1)
 
     return [
         {
@@ -725,6 +830,10 @@ def get_all_employees(include_deleted=False):
             "name":        doc.get("name", "Unknown"),
             "role":        doc.get("role", "employee").capitalize(),
             "department":  doc.get("department", ""),
+            "basic_salary": doc.get("basic_salary", doc.get("salary", "")),
+            "email":       doc.get("email", ""),
+            "phone":       doc.get("phone", ""),
+            "address":     doc.get("address", ""),
             "deleted":     doc.get("deleted", False),
             "deleted_at":  doc.get("deleted_at", ""),
             "joining_date": doc.get("joining_date", doc.get("created_at", "")),
@@ -1423,7 +1532,27 @@ def get_leave_requests(emp_id=None):
     Each record has a string 'request_id' field added.
     """
     query = {} if emp_id is None else {"emp_id": int(emp_id)}
-    docs  = leave_requests_col.find(query).sort("submitted_on", -1)
+    docs  = leave_requests_col.find(
+        query,
+        {
+            "emp_id": 1,
+            "emp_name": 1,
+            "leave_type": 1,
+            "leave_duration": 1,
+            "from_date": 1,
+            "to_date": 1,
+            "days": 1,
+            "paid_days": 1,
+            "unpaid_days": 1,
+            "reason": 1,
+            "status": 1,
+            "submitted_on": 1,
+            "remarks": 1,
+            "revert_reason": 1,
+            "revert_requested_on": 1,
+            "working_dates": 1,
+        },
+    ).sort("submitted_on", -1)
 
     result = []
     for doc in docs:

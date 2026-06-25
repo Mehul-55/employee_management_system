@@ -6,9 +6,95 @@
 ╚══════════════════════════════════════════════╝
 """
 
-import sys
 import os
+import json
+import sys
+import subprocess
+import threading
+import time
+from urllib import error, parse, request
 sys.path.append(os.path.dirname(os.path.abspath(__file__)))
+
+
+def get_api_base_url():
+    try:
+        from dotenv import load_dotenv
+        load_dotenv()
+    except Exception:
+        pass
+    return os.getenv("API_BASE_URL", "http://127.0.0.1:8000").rstrip("/")
+
+
+def _api_health_url():
+    return f"{get_api_base_url()}/api/health"
+
+
+def is_api_running(timeout=1.5):
+    try:
+        with request.urlopen(_api_health_url(), timeout=timeout) as response:
+            return 200 <= response.status < 500
+    except Exception:
+        return False
+
+
+def start_api_server():
+    api_base = get_api_base_url()
+    parsed = parse.urlparse(api_base)
+    host = parsed.hostname or "127.0.0.1"
+    port = parsed.port or 8000
+    if host not in {"127.0.0.1", "localhost"}:
+        print(f"  WARNING API auto-start skipped for non-local host: {api_base}")
+        return False
+
+    base_dir = os.path.dirname(os.path.abspath(__file__))
+    creationflags = 0
+    if os.name == "nt":
+        creationflags = subprocess.CREATE_NEW_PROCESS_GROUP | subprocess.DETACHED_PROCESS
+
+    try:
+        subprocess.Popen(
+            [
+                sys.executable,
+                "-m",
+                "uvicorn",
+                "api_main:app",
+                "--host",
+                host,
+                "--port",
+                str(port),
+            ],
+            cwd=base_dir,
+            stdout=subprocess.DEVNULL,
+            stderr=subprocess.DEVNULL,
+            stdin=subprocess.DEVNULL,
+            creationflags=creationflags,
+        )
+        return True
+    except Exception as exc:
+        print(f"  ERROR Could not auto-start API server -> {exc}")
+        return False
+
+
+def ensure_api_server():
+    print("[CHECK] Checking API server...")
+    if is_api_running():
+        print(f"  OK API server already running at {get_api_base_url()}\n")
+        return True
+
+    print("  INFO API server is not running. Starting it automatically...")
+    if not start_api_server():
+        print("  WARNING Start run_api.bat manually, then run the app again.\n")
+        return False
+
+    for _ in range(20):
+        time.sleep(0.5)
+        if is_api_running(timeout=1):
+            print(f"  OK API server started at {get_api_base_url()}\n")
+            return True
+
+    print("  WARNING API server did not become ready in time.")
+    print("     Check run_api.bat or run: python -m uvicorn api_main:app --host 127.0.0.1 --port 8000\n")
+    return False
 
 
 # ══════════════════════════════════════════════
@@ -18,7 +104,10 @@ def check_dependencies():
     required = {
         "PyQt6":   "PyQt6",
         "pymongo": "pymongo",
+        "dns":     "dnspython",
         "dotenv":  "python-dotenv",
+        "fastapi": "fastapi",
+        "uvicorn": "uvicorn",
     }
     missing = []
     for module, pip_name in required.items():
@@ -78,11 +167,20 @@ def check_db_connection():
     try:
         import db_config
         db_config.client.admin.command("ping")
-        print("  OK MongoDB connected successfully.\n")
+        print(f"  OK {db_config.connection_label()} connected successfully.")
+        print(f"  OK Database selected: {db_config.DB_NAME}\n")
+        try:
+            import db_indexes
+            created = db_indexes.ensure_indexes()
+            print(f"  OK MongoDB indexes ready ({len(created)} checked).\n")
+        except Exception as index_error:
+            print(f"  WARNING MongoDB indexes could not be checked -> {index_error}\n")
         return True
     except Exception as e:
         print(f"  ERROR MongoDB connection failed -> {e}")
-        print("     Make sure MongoDB is running on localhost:27017\n")
+        print("     For local MongoDB: make sure MongoDB is running on localhost:27017.")
+        print("     For MongoDB Atlas: check username, password, database user permissions,")
+        print("     and Network Access IP allowlist in the Atlas dashboard.\n")
         return False
 
 
@@ -113,30 +211,75 @@ class ApplicationController:
             self._app._show_login()
 
     def handle_login(self, mode, username, password, err_label):
-        import auth_model
         try:
-            if mode == "admin":
-                ok, role, msg = auth_model.admin_login(username, password)
-            else:
-                ok, role, msg = auth_model.employee_login(username, password)
+            auth_response = self._api_login(mode, username, password)
 
-            if ok:
-                session_user = username if mode == "admin" else str(role)
-                self._current_user = session_user
-                self._current_role = "admin" if mode == "admin" else "employee"
-                try:
-                    from audit_log import log_action
-                    log_action("LOGIN", session_user,
-                               details=f"{mode.capitalize()} '{session_user}' logged in successfully.")
-                except Exception as e:
-                    print(f"Audit log (login) failed: {e}")
-                self._app.load_dashboard(role, session_user)
-            else:
-                err_label.setText(msg)
+            session_user = username if mode == "admin" else str(auth_response["user_id"])
+            dashboard_role = "admin" if mode == "admin" else str(auth_response["user_id"])
+            self._current_user = session_user
+            self._current_role = "admin" if mode == "admin" else "employee"
+
+            elapsed_ms = auth_response.get("elapsed_ms")
+            if elapsed_ms is not None:
+                print(f"API login verified in {elapsed_ms} ms.")
+
+            self._app.load_dashboard(dashboard_role, session_user)
+
+            threading.Thread(
+                target=self._log_login_async,
+                args=(mode, session_user),
+                daemon=True,
+            ).start()
 
         except Exception as e:
-            print(f"ERROR Backend error: {e}")
-            err_label.setText("System error connecting to database.")
+            print(f"ERROR API login error: {e}")
+            err_label.setText(str(e))
+
+    def _log_login_async(self, mode, session_user):
+        try:
+            from audit_log import log_action
+            log_action(
+                "LOGIN",
+                session_user,
+                details=f"{mode.capitalize()} '{session_user}' logged in successfully through API.",
+            )
+        except Exception as e:
+            print(f"Audit log (login) failed: {e}")
+
+    def _api_login(self, mode, username, password):
+        endpoint = "/api/auth/admin-login" if mode == "admin" else "/api/auth/employee-login"
+        payload = {
+            "username": username,
+            "password": password,
+        } if mode == "admin" else {
+            "emp_id": username,
+            "password": password,
+        }
+        data = json.dumps(payload).encode("utf-8")
+        api_request = request.Request(
+            f"{get_api_base_url()}{endpoint}",
+            data=data,
+            headers={"Content-Type": "application/json"},
+            method="POST",
+        )
+
+        try:
+            with request.urlopen(api_request, timeout=8) as response:
+                return json.loads(response.read().decode("utf-8"))
+        except error.HTTPError as exc:
+            message = exc.reason
+            try:
+                body = json.loads(exc.read().decode("utf-8"))
+                message = body.get("detail") or message
+            except Exception:
+                pass
+            raise RuntimeError(message)
+        except error.URLError:
+            raise RuntimeError(
+                "API server is not responding. Restart the app, or run run_api.bat to see API errors."
+            )
+        except TimeoutError:
+            raise RuntimeError("API login timed out. Check the API server and database connection.")
 
     def is_admin(self):
         return self._current_role == "admin"
@@ -185,6 +328,20 @@ class ApplicationController:
         except Exception as e:
             print(f"Registration error: {e}")
             return False, "Registration failed due to a system error."
+
+    def update_employee_details(self, employee_id, name, basic_salary=0, department=None,
+                                email=None, phone=None, address=None, joining_date=None):
+        if not self.is_admin():
+            return self._admin_denied()
+        import auth_model
+        try:
+            return auth_model.update_employee_details(
+                employee_id, name, basic_salary, department,
+                email=email, phone=phone, address=address, joining_date=joining_date,
+            )
+        except Exception as e:
+            print(f"Update employee error: {e}")
+            return False, "Employee update failed due to a system error."
 
     def get_departments(self):
         if not self.is_admin():
@@ -299,6 +456,10 @@ if __name__ == "__main__":
     print("[CHECK]  Checking database connection...")
     if not check_db_connection():
         print("WARNING  Cannot start without database connection.")
+        sys.exit(1)
+
+    if not ensure_api_server():
+        print("WARNING  Cannot start without API server.")
         sys.exit(1)
 
     controller = ApplicationController()

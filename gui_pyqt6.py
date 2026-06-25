@@ -5,24 +5,52 @@ Install: pip install PyQt6
 """
 
 import sys
+import json
+import os
 from datetime import datetime as _dt
+from urllib import error as url_error, parse, request as url_request
 
 from PyQt6.QtWidgets import (
     QApplication, QMainWindow, QWidget, QFrame, QLabel, QPushButton,
     QLineEdit, QVBoxLayout, QHBoxLayout, QGridLayout, QScrollArea,
     QSizePolicy, QStackedWidget, QMessageBox, QTextEdit, QComboBox,
     QDialog, QCalendarWidget, QDateEdit,
-    QFileDialog, QGraphicsOpacityEffect, QCheckBox, QStyle, QInputDialog
+    QFileDialog, QGraphicsOpacityEffect, QCheckBox, QStyle, QInputDialog,
+    QProgressBar
 )
 from PyQt6.QtCore import (
     Qt, QPropertyAnimation, QEasingCurve, QTimer, QPoint, QSize, QRect, QLineF,
-    pyqtSignal, QParallelAnimationGroup, QDate
+    pyqtSignal, QParallelAnimationGroup, QDate, QObject, QThread, pyqtSlot
 )
 from PyQt6.QtGui import QFont, QColor, QPalette, QCursor, QIcon, QPainter, QPen, QPainterPath, QPixmap
 
 import attendance
 from app_time import today_iso as _app_today_iso
 from audit_log import log_action, get_recent_logs
+
+
+def _api_base_url():
+    try:
+        from dotenv import load_dotenv
+        load_dotenv()
+    except Exception:
+        pass
+    return os.getenv("API_BASE_URL", "http://127.0.0.1:8000").rstrip("/")
+
+
+def _api_get_json(path, params=None, timeout=5):
+    query = f"?{parse.urlencode(params)}" if params else ""
+    req = url_request.Request(
+        f"{_api_base_url()}{path}{query}",
+        headers={"Accept": "application/json"},
+        method="GET",
+    )
+    try:
+        with url_request.urlopen(req, timeout=timeout) as response:
+            return json.loads(response.read().decode("utf-8"))
+    except (url_error.URLError, TimeoutError, json.JSONDecodeError) as exc:
+        print(f"[API WARNING] GET {path} failed: {exc}")
+        return None
 
 # Color Palette
 BG        = "#f5f0e8"
@@ -577,6 +605,65 @@ def fade_in(widget, duration=280):
     QTimer.singleShot(0, _start)
 
 
+class BackgroundWorker(QObject):
+    finished = pyqtSignal(object)
+    failed = pyqtSignal(str)
+
+    def __init__(self, task):
+        super().__init__()
+        self._task = task
+
+    @pyqtSlot()
+    def run(self):
+        try:
+            self.finished.emit(self._task())
+        except Exception as exc:
+            self.failed.emit(str(exc))
+
+
+def run_background(owner, task, on_finished, on_failed=None):
+    thread = QThread(owner)
+    worker = BackgroundWorker(task)
+    worker.moveToThread(thread)
+
+    if not hasattr(owner, "_background_workers"):
+        owner._background_workers = []
+    owner._background_workers.append((thread, worker))
+
+    def _cleanup():
+        try:
+            owner._background_workers = [
+                pair for pair in getattr(owner, "_background_workers", [])
+                if pair[0] is not thread
+            ]
+        except RuntimeError:
+            pass
+        worker.deleteLater()
+        thread.deleteLater()
+
+    def _done(result):
+        try:
+            on_finished(result)
+        finally:
+            thread.quit()
+
+    def _failed(message):
+        try:
+            if on_failed:
+                on_failed(message)
+            else:
+                print(f"[BACKGROUND LOAD ERROR] {message}")
+        finally:
+            thread.quit()
+
+    thread.started.connect(worker.run)
+    worker.finished.connect(_done)
+    worker.failed.connect(_failed)
+    thread.finished.connect(_cleanup)
+    thread.start()
+    return thread
+
+
 # ----------------------------------------------------------------------
 #  SLIDING STACKED WIDGET - smooth slide+fade between pages
 # ----------------------------------------------------------------------
@@ -653,15 +740,63 @@ class SlidingStack(QStackedWidget):
 
         def on_finished():
             self._animating = False
-            self.setCurrentWidget(new_widget)
-            old_widget.setGraphicsEffect(None)
-            new_widget.setGraphicsEffect(None)
-            # Reset geometry using current size so resize during animation is handled correctly
-            new_widget.setGeometry(self.rect())
+            try:
+                if self.indexOf(new_widget) != -1:
+                    self.setCurrentWidget(new_widget)
+                    new_widget.setGraphicsEffect(None)
+                    # Reset geometry using current size so resize during animation is handled correctly
+                    new_widget.setGeometry(self.rect())
+            except RuntimeError:
+                pass
+            try:
+                if old_widget is not None and self.indexOf(old_widget) != -1:
+                    old_widget.setGraphicsEffect(None)
+            except RuntimeError:
+                pass
 
         group.finished.connect(on_finished)
         group.start()
         self._anim_group = group  # prevent GC
+
+    def fade_replace_current(self, new_widget, old_widget=None, duration=220):
+        if self._animating:
+            QTimer.singleShot(40, lambda: self.fade_replace_current(new_widget, old_widget, duration))
+            return
+        old_widget = old_widget or self.currentWidget()
+        if self.indexOf(new_widget) == -1:
+            self.addWidget(new_widget)
+        new_widget.setGeometry(self.rect())
+        new_widget.show()
+        new_widget.raise_()
+
+        self._animating = True
+        effect = QGraphicsOpacityEffect(new_widget)
+        new_widget.setGraphicsEffect(effect)
+        anim = QPropertyAnimation(effect, b"opacity", self)
+        anim.setDuration(duration)
+        anim.setStartValue(0.0)
+        anim.setEndValue(1.0)
+        anim.setEasingCurve(QEasingCurve.Type.OutCubic)
+
+        def on_finished():
+            self._animating = False
+            try:
+                if self.indexOf(new_widget) != -1:
+                    self.setCurrentWidget(new_widget)
+                    new_widget.setGraphicsEffect(None)
+                    new_widget.setGeometry(self.rect())
+            except RuntimeError:
+                pass
+            try:
+                if old_widget is not None and old_widget is not new_widget and self.indexOf(old_widget) != -1:
+                    self.removeWidget(old_widget)
+                    old_widget.deleteLater()
+            except RuntimeError:
+                pass
+
+        anim.finished.connect(on_finished)
+        anim.start()
+        self._fade_replace_anim = anim
 
 
 # ----------------------------------------------------------------------
@@ -830,8 +965,32 @@ class Sidebar(QWidget):
             nav_lay.addWidget(btn)
             self._buttons[key] = btn
 
-        lay.addWidget(nav)
-        lay.addStretch()
+        nav_lay.addStretch()
+        nav_scroll = QScrollArea()
+        nav_scroll.setWidgetResizable(True)
+        nav_scroll.setFrameShape(QFrame.Shape.NoFrame)
+        nav_scroll.setHorizontalScrollBarPolicy(Qt.ScrollBarPolicy.ScrollBarAlwaysOff)
+        nav_scroll.setWidget(nav)
+        nav_scroll.setStyleSheet(f"""
+            QScrollArea {{
+                background: {SIDEBAR};
+                border: none;
+            }}
+            QScrollBar:vertical {{
+                background: transparent;
+                width: 6px;
+                margin: 4px 0 4px 0;
+            }}
+            QScrollBar::handle:vertical {{
+                background: #d6cfc4;
+                border-radius: 3px;
+            }}
+            QScrollBar::add-line:vertical,
+            QScrollBar::sub-line:vertical {{
+                height: 0px;
+            }}
+        """)
+        lay.addWidget(nav_scroll, 1)
         lay.addWidget(divider())
 
         logout_btn = QPushButton("Logout")
@@ -1149,6 +1308,7 @@ class LoginScreen(QWidget):
             }}
         """)
         login_btn.clicked.connect(self._do_login)
+        self._login_btn = login_btn
         card_lay.addWidget(login_btn)
         card_lay.addSpacing(16)
 
@@ -1249,7 +1409,18 @@ class LoginScreen(QWidget):
             self._err_label.setText("Please fill in all fields.")
             return
         self._err_label.setText("")
+        if hasattr(self, "_login_btn"):
+            self._login_btn.setEnabled(False)
+            self._login_btn.setText("SIGNING IN...")
+        QApplication.setOverrideCursor(QCursor(Qt.CursorShape.WaitCursor))
+        app = QApplication.instance()
+        if app is not None:
+            app.processEvents()
         self.controller.handle_login(self._mode, user, pw, self._err_label)
+        QApplication.restoreOverrideCursor()
+        if self._err_label.text() and hasattr(self, "_login_btn"):
+            self._login_btn.setEnabled(True)
+            self._login_btn.setText("SIGN IN")
 
 
 # ----------------------------------------------------------------------
@@ -1268,6 +1439,160 @@ def make_scroll(inner_widget):
     scroll.setStyleSheet(f"background: transparent; border: none;")
     inner_widget.setStyleSheet(f"background: transparent;")
     return scroll
+
+
+def clear_layout(layout):
+    while layout.count():
+        item = layout.takeAt(0)
+        if item.widget():
+            item.widget().setParent(None)
+
+
+def make_loading_panel(message="Loading data...", columns=6, rows=6):
+    panel = QWidget()
+    panel.setStyleSheet(f"""
+        QWidget {{
+            background: rgba(250, 247, 242, 96);
+            border: 1px solid rgba(217, 208, 192, 105);
+            border-radius: 10px;
+        }}
+    """)
+    lay = QVBoxLayout(panel)
+    lay.setContentsMargins(18, 16, 18, 16)
+    lay.setSpacing(12)
+
+    top_row = QWidget()
+    top_row.setStyleSheet("background: transparent; border: none;")
+    top_lay = QHBoxLayout(top_row)
+    top_lay.setContentsMargins(0, 0, 0, 0)
+    top_lay.setSpacing(10)
+
+    label = make_label(message, 13, TEXT2, bold=True)
+    label.setStyleSheet(f"color: {TEXT2}; font-size: 13px; font-weight: 800; background: transparent; border: none;")
+    top_lay.addWidget(label)
+    top_lay.addStretch()
+
+    pulse = QFrame()
+    pulse.setFixedSize(64, 10)
+    pulse.setStyleSheet("""
+        QFrame {{
+            background: transparent;
+            border: 1px solid rgba(217, 208, 192, 100);
+            border-radius: 5px;
+        }}
+    """)
+    top_lay.addWidget(pulse)
+    lay.addWidget(top_row)
+
+    lay.addWidget(GlassLoadingShell())
+    return panel
+
+
+def show_layout_loading(layout, message="Loading data...", columns=6, rows=6):
+    clear_layout(layout)
+    layout.addWidget(make_loading_panel(message, columns=columns, rows=rows))
+    app = QApplication.instance()
+    if app is not None:
+        app.processEvents()
+
+
+def make_outline_placeholder(height=44):
+    block = QWidget()
+    block.setMinimumHeight(height)
+    block.setSizePolicy(QSizePolicy.Policy.Expanding, QSizePolicy.Policy.Fixed)
+    block.setStyleSheet("""
+        QWidget {
+            background: rgba(245, 240, 232, 58);
+            border: 1px solid rgba(217, 208, 192, 82);
+            border-radius: 8px;
+        }
+    """)
+    return block
+
+
+def make_outline_row(heights):
+    row = QWidget()
+    row.setStyleSheet("background: transparent; border: none;")
+    lay = QHBoxLayout(row)
+    lay.setContentsMargins(0, 0, 0, 0)
+    lay.setSpacing(10)
+    for height in heights:
+        lay.addWidget(make_outline_placeholder(height))
+    return row
+
+
+class GlassLoadingShell(QFrame):
+    def __init__(self):
+        super().__init__()
+        self.setStyleSheet("""
+            QFrame {
+                background: rgba(245, 240, 232, 72);
+                border: 1px solid rgba(217, 208, 192, 90);
+                border-radius: 9px;
+            }
+        """)
+        self.setMinimumHeight(260)
+        self.setSizePolicy(QSizePolicy.Policy.Expanding, QSizePolicy.Policy.Expanding)
+
+        self._shine = QFrame(self)
+        self._shine.setStyleSheet("""
+            QFrame {
+                background: qlineargradient(
+                    x1:0, y1:0, x2:1, y2:0,
+                    stop:0 rgba(255,255,255,0),
+                    stop:0.42 rgba(255,255,255,42),
+                    stop:0.50 rgba(255,255,255,105),
+                    stop:0.58 rgba(255,255,255,42),
+                    stop:1 rgba(255,255,255,0)
+                );
+                border: none;
+            }
+        """)
+        self._shine.setFixedWidth(150)
+
+        self._shine_anim = QPropertyAnimation(self._shine, b"pos", self)
+        self._shine_anim.setDuration(1350)
+        self._shine_anim.setLoopCount(-1)
+        self._shine_anim.setEasingCurve(QEasingCurve.Type.InOutSine)
+        QTimer.singleShot(0, self._start_shine)
+
+    def resizeEvent(self, event):
+        super().resizeEvent(event)
+        self._shine.setFixedHeight(self.height())
+        self._start_shine()
+
+    def _start_shine(self):
+        if self.width() <= 0 or self.height() <= 0:
+            return
+        self._shine.setFixedHeight(self.height())
+        self._shine_anim.stop()
+        self._shine_anim.setStartValue(QPoint(-self._shine.width(), 0))
+        self._shine_anim.setEndValue(QPoint(self.width() + self._shine.width(), 0))
+        self._shine_anim.start()
+
+
+def make_table_loading_page(title, subtitle, message, columns=6, rows=7, blocks=None):
+    page = QWidget()
+    page.setStyleSheet(f"background: {BG2};")
+    lay = QVBoxLayout(page)
+    lay.setContentsMargins(28, 28, 28, 28)
+    lay.setSpacing(0)
+    lay.addWidget(make_label(title, 20, TEXT, bold=True))
+    if subtitle:
+        lay.addSpacing(4)
+        lay.addWidget(make_label(subtitle, 13, TEXT3))
+    lay.addSpacing(16)
+    lay.addWidget(divider())
+    lay.addSpacing(16)
+    for block in blocks or []:
+        if isinstance(block, (list, tuple)):
+            lay.addWidget(make_outline_row(block))
+        else:
+            lay.addWidget(make_outline_placeholder(block))
+        lay.addSpacing(10)
+    lay.addWidget(make_loading_panel(message, columns=columns, rows=rows))
+    lay.addStretch()
+    return page
 
 
 def make_sticky_table_scroll(header_widget, rows_widget, rows_height=None, header_height=52):
@@ -1342,10 +1667,29 @@ class AdminDashboard(QWidget):
         super().__init__()
         self.controller = controller
         self.username   = username
+        self._monthly_report_cache = {}
         self.setStyleSheet(f"background: {BG};")
         self._build()
         self._absent_timers = []
-        self._schedule_auto_absent()
+        QTimer.singleShot(1500, self._schedule_auto_absent)
+
+    def _cached_monthly_attendance_report(self, month=None, year=None):
+        today = _app_today_iso()
+        if month is None or year is None:
+            year_str, month_str = today.split("-")[:2]
+            month = int(month_str)
+            year = int(year_str)
+        key = (int(month), int(year), today)
+        if key not in self._monthly_report_cache:
+            self._monthly_report_cache.clear()
+            self._monthly_report_cache[key] = attendance.get_monthly_attendance_report(month, year)
+        return self._monthly_report_cache[key]
+
+    def _cached_attendance_pct_map(self, month=None, year=None):
+        return {
+            str(row.get("emp_id")): row.get("attendance_percentage", 0)
+            for row in self._cached_monthly_attendance_report(month, year)
+        }
 
     # ------------------------------------------------------------------
     #  AUTO ABSENT — fires once per shift end, catches up on startup
@@ -1356,10 +1700,6 @@ class AdminDashboard(QWidget):
         now = _dt.now()
 
         for shift_name, hour, minute in self._SHIFT_ENDS:
-            # Always catch up once on startup. The backend resumes from the
-            # persisted per-shift checkpoint and processes every missed date.
-            self._run_auto_absent(shift_name, catchup=True)
-
             shift_end = now.replace(hour=hour, minute=minute, second=0, microsecond=0)
 
             if shift_end <= now:
@@ -1371,6 +1711,8 @@ class AdminDashboard(QWidget):
             timer.timeout.connect(lambda s=shift_name, h=hour, m=minute: self._on_shift_end(s, h, m))
             timer.start(ms_until)
             self._absent_timers.append(timer)
+
+        QTimer.singleShot(2500, lambda: self._run_auto_absent(catchup=True))
 
     def _on_shift_end(self, shift_name, hour, minute):
         self._run_auto_absent(shift_name)
@@ -1406,7 +1748,7 @@ class AdminDashboard(QWidget):
 
         self._feature_items = [
             ("employees",        "SP_FileDialogDetailedView", "All Employees",     "All Employees"),
-            ("add",              "SP_FileDialogNewFolder",    "Add Employee",      "Add Employee"),
+            ("add",              "SP_FileDialogNewFolder",    "Add Employee / Edit", "Add Employee / Edit"),
             ("delete",           "SP_TrashIcon",              "Delete Employee",   "Delete Employee"),
             ("reset",            "SP_DialogResetButton",      "Reset Password",     "Reset Password"),
             ("attendance",       "SP_FileDialogListView",     "Attendance",         "Attendance"),
@@ -1419,7 +1761,7 @@ class AdminDashboard(QWidget):
         ]
         nav_items = [
             ("dashboard",        "aSz", "Dashboard"),
-        ]
+        ] + [(key, icon_name, short_label) for key, icon_name, short_label, _ in self._feature_items]
         self._sidebar = Sidebar(nav_items, self._show_page, self.controller.show_login, "ADMIN PANEL")
         lay.addWidget(self._sidebar)
 
@@ -1430,13 +1772,60 @@ class AdminDashboard(QWidget):
         self._pages = {}
         self._sidebar.select("dashboard")
 
+    def _loading_spec(self, key):
+        return {
+            "employees": ("All Employees", "Full employee roster", "Loading employees...", 7, 7, [(36, 36), 30]),
+            "attendance": ("Attendance", "Mark and review daily attendance", "Loading attendance...", 8, 5, [154, 34, 38]),
+            "leaves": ("Manage Leaves", "Set total allowed leaves per employee", "Loading leave balances...", 5, 7, [94, 34]),
+            "leave_requests": ("Leave Requests", "Approve or reject employee leave requests", "Loading leave requests...", 11, 7, [24, 32, 32]),
+            "shift_management": ("Shift Management", "Assign shifts and approve Sunday work", "Loading shift management...", 6, 7, [(76, 76, 76), 112, 104]),
+            "monthly_attendance": ("Monthly Attendance", "Monthly attendance summary", "Calculating monthly report...", 14, 7, [38, 22, (76, 76, 76, 76, 76)]),
+            "daily_report": ("Daily Report", "Daily attendance report", "Loading daily report...", 10, 7, [38, 40]),
+            "salary_report": ("Salary Report", "Salary and payroll summary", "Loading salary report...", 12, 7, [128, 44, (76, 76, 76, 76)]),
+        }.get(key)
+
+    def _replace_loading_page(self, key, loading_page):
+        if self._pages.get(key) is not loading_page:
+            return
+        if getattr(self._stack, "_animating", False):
+            QTimer.singleShot(40, lambda k=key, p=loading_page: self._replace_loading_page(k, p))
+            return
+        real_page = self._build_page(key)
+        self._pages[key] = real_page
+        self._stack.addWidget(real_page)
+        if self._stack.currentWidget() is loading_page:
+            self._stack.fade_replace_current(real_page, loading_page)
+        else:
+            self._remove_loading_widget(loading_page)
+
+    def _remove_loading_widget(self, widget):
+        try:
+            if getattr(self._stack, "_animating", False):
+                QTimer.singleShot(50, lambda w=widget: self._remove_loading_widget(w))
+                return
+            if self._stack.indexOf(widget) != -1 and self._stack.currentWidget() is not widget:
+                self._stack.removeWidget(widget)
+                widget.deleteLater()
+        except RuntimeError:
+            pass
+
     def _show_page(self, key):
-        # BUG FIX: always rebuild salary_report so updated basic salaries are never stale
+        # Always rebuild salary_report so updated basic salaries are never stale.
         if key == "salary_report" and key in self._pages:
             old = self._pages.pop(key)
             self._stack.removeWidget(old)
             old.deleteLater()
         if key not in self._pages:
+            loading_spec = self._loading_spec(key)
+            if loading_spec:
+                title, subtitle, message, columns, rows, *rest = loading_spec
+                blocks = rest[0] if rest else None
+                page = make_table_loading_page(title, subtitle, message, columns=columns, rows=rows, blocks=blocks)
+                self._pages[key] = page
+                self._stack.addWidget(page)
+                self._stack.slide_to(page)
+                QTimer.singleShot(220, lambda k=key, p=page: self._replace_loading_page(k, p))
+                return
             page = self._build_page(key)
             self._pages[key] = page
             self._stack.addWidget(page)
@@ -1474,13 +1863,20 @@ class AdminDashboard(QWidget):
         inner = QWidget(); inner.setStyleSheet("background: transparent;")
         il = QVBoxLayout(inner); il.setContentsMargins(28, 28, 28, 28); il.setSpacing(0)
 
-        from datetime import date as _date
-
-        emp = self.controller.get_all_employees()
-        emp.sort(key=lambda u: int(u["id"]) if str(u["id"]).isdigit() else 0)
-        today_str = _app_today_iso()
-        active_count = sum(1 for u in emp if self.controller.account_exists(u["id"]))
-        registered_today = sum(1 for u in emp if str(u.get("created_at", "")).startswith(today_str))
+        summary = _api_get_json("/api/dashboard/admin-summary", {"audit_limit": 25})
+        if summary:
+            stats = summary.get("stats", {})
+            total_employees = stats.get("total_employees", 0)
+            active_count = stats.get("active_accounts", 0)
+            registered_today = stats.get("registered_today", 0)
+            emp = summary.get("recent_employees", [])
+        else:
+            emp = self.controller.get_all_employees()
+            emp.sort(key=lambda u: int(u["id"]) if str(u["id"]).isdigit() else 0)
+            today_str = _app_today_iso()
+            total_employees = len(emp)
+            active_count = sum(1 for u in emp if not u.get("deleted"))
+            registered_today = sum(1 for u in emp if str(u.get("created_at", "")).startswith(today_str))
 
         il.addWidget(make_label("Dashboard", 20, TEXT, bold=True))
         il.addSpacing(4)
@@ -1499,7 +1895,7 @@ class AdminDashboard(QWidget):
             cl.addWidget(make_label(lbl_text, 11, TEXT3),             alignment=Qt.AlignmentFlag.AlignCenter)
             return card
 
-        stats_row.addWidget(stat_card(len(emp),     "Total employees"))
+        stats_row.addWidget(stat_card(total_employees, "Total employees"))
         stats_row.addWidget(stat_card(active_count, "Active accounts", SUCCESS))
         stats_row.addWidget(stat_card(registered_today, "Registered today"))
         il.addLayout(stats_row)
@@ -1550,7 +1946,8 @@ class AdminDashboard(QWidget):
         # Recent employees
         il.addWidget(make_label("Recent employees", 14, TEXT, bold=True))
         il.addSpacing(10)
-        il.addWidget(self._employee_table(emp[:6]))
+        pct_map = self._cached_attendance_pct_map()
+        il.addWidget(self._employee_table(emp[:6], attendance_pct_map=pct_map))
         il.addSpacing(24)
 
         # ----------------------------------------------------------------------
@@ -1692,11 +2089,23 @@ class AdminDashboard(QWidget):
             dl.addLayout(btn_row)
             dlg.exec()
 
-        def _reload_audit():
+        initial_audit_logs = summary.get("audit_logs", []) if summary else None
+
+        def _reload_audit(logs_override=None):
             while rows_l.count():
                 item = rows_l.takeAt(0)
                 if item.widget(): item.widget().setParent(None)
-            logs = get_recent_logs(limit=100, important_only=self._audit_important_only)
+            if logs_override is not None:
+                logs = logs_override
+            else:
+                response = _api_get_json(
+                    "/api/audit-logs",
+                    {"limit": 100, "important_only": self._audit_important_only},
+                )
+                logs = response.get("logs", []) if response else get_recent_logs(
+                    limit=100,
+                    important_only=self._audit_important_only,
+                )
             if not logs:
                 rows_l.addWidget(make_label("No audit logs found.", 12, TEXT3))
                 return
@@ -1746,8 +2155,9 @@ class AdminDashboard(QWidget):
             _reload_audit()
 
         toggle_btn.clicked.connect(_toggle_filter)
-        refresh_btn.clicked.connect(_reload_audit)
-        _reload_audit()
+        refresh_btn.clicked.connect(lambda checked=False: _reload_audit())
+        rows_l.addWidget(make_label("Loading audit logs...", 12, TEXT3))
+        QTimer.singleShot(350, lambda: _reload_audit(initial_audit_logs))
 
         scroll = make_scroll(inner)
         lay.addWidget(scroll)
@@ -1801,9 +2211,14 @@ class AdminDashboard(QWidget):
         self._emp_table_lay = QVBoxLayout(self._emp_table_container); self._emp_table_lay.setContentsMargins(0,0,0,0)
         il.addWidget(self._emp_table_container)
 
+        dept_cache = {"value": None}
+        employee_cache = {"include_deleted": None, "rows": []}
+
         def _refresh_dept_filter(emps):
             current = self._emp_dept_cb.currentText() if self._emp_dept_cb.count() else "All Departments"
-            db_depts = self.controller.get_departments()
+            if dept_cache["value"] is None:
+                dept_cache["value"] = self.controller.get_departments()
+            db_depts = dept_cache["value"]
             employee_depts = [display_department(u) for u in emps if display_department(u) != "N/A"]
             depts = ["All Departments"] + sorted({*db_depts, *employee_depts})
             self._emp_dept_cb.blockSignals(True)
@@ -1813,9 +2228,47 @@ class AdminDashboard(QWidget):
             self._emp_dept_cb.setCurrentIndex(idx if idx >= 0 else 0)
             self._emp_dept_cb.blockSignals(False)
 
+        attendance_pct_cache = {}
+
+        def _attendance_pct_map():
+            today = _app_today_iso()
+            cache_key = today[:7]
+            if cache_key not in attendance_pct_cache:
+                attendance_pct_cache.clear()
+                attendance_pct_cache[cache_key] = self._cached_attendance_pct_map()
+            return attendance_pct_cache[cache_key]
+
         def _reload_emp_table():
             include_del = self._show_deleted_cb.isChecked()
-            emps = self.controller.get_all_employees(include_deleted=include_del)
+            needs_fetch = employee_cache["include_deleted"] != include_del
+            if needs_fetch:
+                show_layout_loading(self._emp_table_lay, "Loading employees...", columns=7, rows=7)
+
+                def _load_employees():
+                    rows = self.controller.get_all_employees(include_deleted=include_del)
+                    depts = self.controller.get_departments()
+                    pct_map = self._cached_attendance_pct_map()
+                    return rows, depts, pct_map
+
+                def _loaded(result):
+                    rows, depts, pct_map = result
+                    employee_cache["include_deleted"] = include_del
+                    employee_cache["rows"] = rows
+                    dept_cache["value"] = depts
+                    attendance_pct_cache.clear()
+                    attendance_pct_cache[_app_today_iso()[:7]] = pct_map
+                    _render_emp_table()
+
+                def _failed(message):
+                    clear_layout(self._emp_table_lay)
+                    self._emp_table_lay.addWidget(make_label(f"Could not load employees: {message}", 12, DANGER))
+
+                run_background(self, _load_employees, _loaded, _failed)
+                return
+            _render_emp_table()
+
+        def _render_emp_table():
+            emps = list(employee_cache["rows"])
             _refresh_dept_filter(emps)
             query = self._emp_search_e.text().strip().lower()
             dept_filter = self._emp_dept_cb.currentText()
@@ -1831,20 +2284,20 @@ class AdminDashboard(QWidget):
             if dept_filter != "All Departments":
                 emps = [u for u in emps if display_department(u) == dept_filter]
             emps.sort(key=lambda u: int(u["id"]) if str(u["id"]).isdigit() else 0)
-            # clear old table
-            while self._emp_table_lay.count():
-                item = self._emp_table_lay.takeAt(0)
-                if item.widget(): item.widget().setParent(None)
-            self._emp_table_lay.addWidget(self._employee_table(emps, show_delete=True))
+            clear_layout(self._emp_table_lay)
+            self._emp_table_lay.addWidget(
+                self._employee_table(emps, show_delete=True, attendance_pct_map=_attendance_pct_map())
+            )
 
         self._show_deleted_cb.stateChanged.connect(lambda _: _reload_emp_table())
-        _reload_emp_table()
+        show_layout_loading(self._emp_table_lay, "Loading employees...", columns=7, rows=7)
+        QTimer.singleShot(0, _reload_emp_table)
         il.addStretch()
         scroll = make_scroll(inner)
         lay.addWidget(scroll)
         return page
 
-    def _employee_table(self, users, show_delete=False):
+    def _employee_table(self, users, show_delete=False, attendance_pct_map=None):
         container = QWidget(); container.setStyleSheet("background: transparent;")
         vlay = QVBoxLayout(container); vlay.setContentsMargins(0,0,0,0); vlay.setSpacing(0)
 
@@ -1892,7 +2345,10 @@ class AdminDashboard(QWidget):
             badge.setAlignment(Qt.AlignmentFlag.AlignCenter)
             rlay.addWidget(badge, 1)
 
-            attendance_pct = attendance.get_employee_monthly_attendance_percentage(u["id"])
+            if attendance_pct_map is None:
+                attendance_pct = attendance.get_employee_monthly_attendance_percentage(u["id"])
+            else:
+                attendance_pct = attendance_pct_map.get(str(u["id"]), 0)
             pct_color = SUCCESS if attendance_pct >= 90 else ("#f0a500" if attendance_pct >= 75 else DANGER)
             pct_lbl = make_label(f"{attendance_pct}%", 12, pct_color, bold=True)
             pct_lbl.setAlignment(Qt.AlignmentFlag.AlignCenter)
@@ -1964,9 +2420,11 @@ class AdminDashboard(QWidget):
     def _page_add(self):
         page = QWidget(); page.setStyleSheet(f"background: {BG2};")
         outer_lay = QVBoxLayout(page); outer_lay.setContentsMargins(28,28,28,28); outer_lay.setSpacing(0)
-        outer_lay.addWidget(make_label("Add Employee",                    20, TEXT, bold=True))
+        title_lbl = make_label("Add Employee / Edit", 20, TEXT, bold=True)
+        subtitle_lbl = make_label("Register a new employee account", 13, TEXT3)
+        outer_lay.addWidget(title_lbl)
         outer_lay.addSpacing(4)
-        outer_lay.addWidget(make_label("Register a new employee account", 13, TEXT3))
+        outer_lay.addWidget(subtitle_lbl)
         outer_lay.addSpacing(16); outer_lay.addWidget(divider()); outer_lay.addSpacing(16)
 
         # Scrollable form so all fields are accessible on smaller screens
@@ -1978,6 +2436,23 @@ class AdminDashboard(QWidget):
 
         form = card_frame()
         fl = QVBoxLayout(form); fl.setContentsMargins(20,20,20,20); fl.setSpacing(8)
+
+        mode_row = QHBoxLayout(); mode_row.setSpacing(10)
+        mode_row.addWidget(make_label("Mode", 12, TEXT2))
+        mode_cb = QComboBox()
+        mode_cb.addItems(["Register New Employee", "Edit Existing Employee"])
+        mode_cb.setMinimumHeight(38)
+        mode_cb.setStyleSheet(combo_box_style(14))
+        mode_row.addWidget(mode_cb, 1)
+        fl.addLayout(mode_row)
+
+        edit_row = QHBoxLayout(); edit_row.setSpacing(10)
+        edit_row.addWidget(make_label("Select Employee", 12, TEXT2))
+        edit_cb = QComboBox()
+        edit_cb.setMinimumHeight(38)
+        edit_cb.setStyleSheet(combo_box_style(14))
+        edit_row.addWidget(edit_cb, 1)
+        fl.addLayout(edit_row)
 
         # ── Core fields ──────────────────────────────────────────────
         fl.addWidget(make_label("Employee ID", 12, TEXT2))
@@ -2047,7 +2522,86 @@ class AdminDashboard(QWidget):
         scroll_lay.addStretch()
         outer_lay.addWidget(scroll, stretch=1)
 
+        employee_cache = []
+
+        def _format_salary(value):
+            try:
+                return str(int(float(value))) if float(value).is_integer() else str(float(value))
+            except (ValueError, TypeError):
+                return str(value or "")
+
+        def _load_employee_choices():
+            nonlocal employee_cache
+            employee_cache = self.controller.get_all_employees(include_deleted=False)
+            employee_cache.sort(key=lambda u: int(u["id"]) if str(u.get("id", "")).isdigit() else 0)
+            current = edit_cb.currentData()
+            edit_cb.blockSignals(True)
+            edit_cb.clear()
+            if not employee_cache:
+                edit_cb.addItem("No active employees found", "")
+            else:
+                for emp in employee_cache:
+                    edit_cb.addItem(f"{emp.get('id', '')} - {emp.get('name', 'Unknown')}", str(emp.get("id", "")))
+            if current:
+                idx = edit_cb.findData(current)
+                if idx >= 0:
+                    edit_cb.setCurrentIndex(idx)
+            edit_cb.blockSignals(False)
+
+        def _selected_employee():
+            selected_id = str(edit_cb.currentData() or "")
+            return next((emp for emp in employee_cache if str(emp.get("id", "")) == selected_id), None)
+
+        def _clear_form():
+            id_e.setEnabled(True)
+            id_e.clear(); name_e.clear(); pass_e.clear(); sal_e.clear()
+            join_e.setText(QDate.currentDate().toString("dd/MM/yy"))
+            dept_cb.setCurrentIndex(0)
+            email_e.clear(); phone_e.clear(); address_e.clear()
+
+        def _fill_employee(emp):
+            if not emp:
+                return
+            id_e.setText(str(emp.get("id", "")))
+            name_e.setText(str(emp.get("name", "")))
+            dept = str(emp.get("department", "") or "")
+            idx = dept_cb.findText(dept)
+            dept_cb.setCurrentIndex(idx if idx >= 0 else 0)
+            pass_e.clear()
+            sal_e.setText(_format_salary(emp.get("basic_salary", "")))
+            join_e.setText(display_date(emp.get("joining_date", "")))
+            email_e.setText(str(emp.get("email", "") or ""))
+            phone_e.setText(str(emp.get("phone", "") or ""))
+            address_e.setPlainText(str(emp.get("address", "") or ""))
+
+        def _set_mode():
+            editing = mode_cb.currentIndex() == 1
+            title_lbl.setText("Add Employee / Edit")
+            subtitle_lbl.setText("Register a new employee account or update an existing employee")
+            edit_cb.setVisible(editing)
+            for i in range(edit_row.count()):
+                item = edit_row.itemAt(i)
+                if item.widget():
+                    item.widget().setVisible(editing)
+            id_e.setEnabled(not editing)
+            pass_e.setEnabled(not editing)
+            pass_e.setPlaceholderText("Password unchanged while editing" if editing else "Set initial password")
+            btn.setText("Update Employee" if editing else "Register Employee")
+            msg_lbl.clear()
+            if editing:
+                if not employee_cache:
+                    _load_employee_choices()
+                _fill_employee(_selected_employee())
+            else:
+                _clear_form()
+
+        def _on_employee_selected():
+            if mode_cb.currentIndex() == 1:
+                _fill_employee(_selected_employee())
+                msg_lbl.clear()
+
         def do_add():
+            editing = mode_cb.currentIndex() == 1
             eid     = id_e.text().strip()
             name    = name_e.text().strip()
             pw      = pass_e.text().strip()
@@ -2058,26 +2612,52 @@ class AdminDashboard(QWidget):
             phone   = phone_e.text().strip()
             address = address_e.toPlainText().strip()
 
-            if not eid or not name or not pw or not sal or not joining or dept == "Select Department":
-                msg_lbl.setText("Employee ID, Name, Department, Password, Salary and Joining Date are required.")
+            if not eid or not name or not sal or not joining or dept == "Select Department" or (not editing and not pw):
+                password_msg = ", Password" if not editing else ""
+                msg_lbl.setText(f"Employee ID, Name, Department{password_msg}, Salary and Joining Date are required.")
                 msg_lbl.setStyleSheet(f"color: {DANGER}; font-size: 12px;")
                 return
 
-            ok, msg = self.controller.register_employee(
-                eid, name, pw, sal, dept,
-                email=email or None,
-                phone=phone or None,
-                address=address or None,
-                joining_date=joining,
-            )
+            if editing:
+                ok, msg = self.controller.update_employee_details(
+                    eid, name, sal, dept,
+                    email=email or None,
+                    phone=phone or None,
+                    address=address or None,
+                    joining_date=joining,
+                )
+            else:
+                ok, msg = self.controller.register_employee(
+                    eid, name, pw, sal, dept,
+                    email=email or None,
+                    phone=phone or None,
+                    address=address or None,
+                    joining_date=joining,
+                )
             msg_lbl.setText(msg)
             msg_lbl.setStyleSheet(f"color: {SUCCESS if ok else DANGER}; font-size: 12px;")
             if ok:
-                id_e.clear(); name_e.clear(); pass_e.clear(); sal_e.clear()
-                join_e.setText(QDate.currentDate().toString("dd/MM/yy"))
-                dept_cb.setCurrentIndex(0)
-                email_e.clear(); phone_e.clear(); address_e.clear()
+                log_action(
+                    "UPDATE_EMPLOYEE" if editing else "ADD_EMPLOYEE",
+                    self.username,
+                    target=str(eid),
+                    details=f"{'Updated' if editing else 'Registered'} employee {eid} ({name}).",
+                )
+                old_employees_page = self._pages.pop("employees", None)
+                if old_employees_page is not None:
+                    self._stack.removeWidget(old_employees_page)
+                    old_employees_page.deleteLater()
+                if editing:
+                    _load_employee_choices()
+                    _fill_employee(_selected_employee())
+                else:
+                    _load_employee_choices()
+                    _clear_form()
 
+        _load_employee_choices()
+        edit_cb.currentIndexChanged.connect(lambda _: _on_employee_selected())
+        mode_cb.currentIndexChanged.connect(lambda _: _set_mode())
+        _set_mode()
         btn.clicked.connect(do_add)
         return page
 
@@ -2280,30 +2860,37 @@ class AdminDashboard(QWidget):
                 return None, None
 
         def _reload_table():
-            while rows_lay.count():
-                item = rows_lay.takeAt(0)
-                if item.widget(): item.widget().setParent(None)
-            records = attendance.get_attendance_by_date(self._att_view_date)
+            show_layout_loading(rows_lay, "Loading attendance...", columns=8, rows=5)
             flt = self._att_status_filter
-            if flt != "All":
-                records = [r for r in records if r.get("status", "") == flt]
-            if not records:
-                rows_lay.addWidget(make_label(f"No records for {display_date(self._att_view_date)}.", 12, TEXT3))
-                return
-            for rec in records:
-                row = QWidget()
-                row.setStyleSheet(f"background: {BG3}; border: 1px solid {BORDER}; border-radius: 5px;")
-                rl = QHBoxLayout(row); rl.setContentsMargins(4,6,4,6)
-                status = rec.get("status", "N/A")
-                display_status = "Missed Checkout" if attendance.is_missed_checkout(rec) else status
-                vals = [str(rec.get("emp_id","N/A")), rec.get("name","N/A"), rec.get("department","N/A"),
-                        display_status, rec.get("arrival_time") or "N/A", rec.get("checkout_time") or "N/A",
-                        str(rec.get("hours_worked") or "N/A"), str(rec.get("late_minutes",0))]
-                for j, val in enumerate(vals):
-                    clr = STATUS_CLR.get(val, TEXT) if j == 3 else TEXT
-                    l = make_label(val, 12, clr); l.setAlignment(Qt.AlignmentFlag.AlignCenter)
-                    rl.addWidget(l)
-                rows_lay.addWidget(row)
+
+            def _render(records):
+                if flt != "All":
+                    records = [r for r in records if r.get("status", "") == flt]
+                clear_layout(rows_lay)
+                if not records:
+                    rows_lay.addWidget(make_label(f"No records for {display_date(self._att_view_date)}.", 12, TEXT3))
+                    return
+                for rec in records:
+                    row = QWidget()
+                    row.setStyleSheet(f"background: {BG3}; border: 1px solid {BORDER}; border-radius: 5px;")
+                    rl = QHBoxLayout(row); rl.setContentsMargins(4,6,4,6)
+                    status = rec.get("status", "N/A")
+                    display_status = "Missed Checkout" if attendance.is_missed_checkout(rec) else status
+                    vals = [str(rec.get("emp_id","N/A")), rec.get("name","N/A"), rec.get("department","N/A"),
+                            display_status, rec.get("arrival_time") or "N/A", rec.get("checkout_time") or "N/A",
+                            str(rec.get("hours_worked") or "N/A"), str(rec.get("late_minutes",0))]
+                    for j, val in enumerate(vals):
+                        clr = STATUS_CLR.get(val, TEXT) if j == 3 else TEXT
+                        l = make_label(val, 12, clr); l.setAlignment(Qt.AlignmentFlag.AlignCenter)
+                        rl.addWidget(l)
+                    rows_lay.addWidget(row)
+
+            def _failed(message):
+                clear_layout(rows_lay)
+                rows_lay.addWidget(make_label(f"Could not load attendance: {message}", 12, DANGER))
+
+            query_date = self._att_view_date
+            run_background(self, lambda: attendance.get_attendance_by_date(query_date), _render, _failed)
 
         def _load_att_date():
             raw = self._att_date_e.text().strip() or display_date(_app_today_iso())
@@ -2499,7 +3086,8 @@ class AdminDashboard(QWidget):
         absent_btn.clicked.connect(do_absent)
         auto_btn.clicked.connect(do_auto_absent)
         all_present_btn.clicked.connect(do_all_present)
-        _reload_table()
+        show_layout_loading(rows_lay, "Loading attendance...", columns=8, rows=5)
+        QTimer.singleShot(0, _reload_table)
         return page
 
     # Manage Leaves
@@ -2572,26 +3160,49 @@ class AdminDashboard(QWidget):
         lay.addStretch()
 
         def _reload():
-            while rows_l.count():
-                item = rows_l.takeAt(0)
-                if item.widget(): item.widget().setParent(None)
+            show_layout_loading(rows_l, "Loading leave balances...", columns=5, rows=7)
             flt = self._lv_filter
-            for emp in sorted(self.controller.get_all_employees(), key=lambda u: int(u["id"]) if str(u["id"]).isdigit() else 0):
-                ok2, info = get_employee_leaves(emp["id"])
-                remaining = info["remaining"] if ok2 else 0
-                if flt == "Has Leaves" and (not ok2 or remaining <= 0): continue
-                if flt == "No Leaves"  and (not ok2 or remaining > 0):  continue
-                total     = info["total"]     if ok2 else "N/A"
-                used      = info["used"]      if ok2 else "N/A"
-                remaining_val = info["remaining"] if ok2 else "N/A"
-                rem_color = SUCCESS if ok2 and info["remaining"] > 0 else DANGER
-                row = QWidget()
-                row.setStyleSheet(f"background: {BG3}; border: 1px solid {BORDER}; border-radius: 6px;")
-                rl  = QHBoxLayout(row); rl.setContentsMargins(10,8,10,8)
-                for val, stretch, clr in [(emp["id"],1,TEXT2),(emp["name"],4,TEXT),(str(total),1,TEXT),(str(used),1,TEXT2),(str(remaining_val),1,rem_color)]:
-                    l = make_label(str(val), 12, clr); l.setAlignment(Qt.AlignmentFlag.AlignCenter)
-                    rl.addWidget(l, stretch)
-                rows_l.addWidget(row)
+
+            def _load_balances():
+                rows = []
+                employees = sorted(
+                    self.controller.get_all_employees(),
+                    key=lambda u: int(u["id"]) if str(u["id"]).isdigit() else 0,
+                )
+                for emp in employees:
+                    ok2, info = get_employee_leaves(emp["id"])
+                    rows.append((emp, ok2, info))
+                return rows
+
+            def _render(rows):
+                clear_layout(rows_l)
+                shown = 0
+                for emp, ok2, info in rows:
+                    remaining = info["remaining"] if ok2 else 0
+                    if flt == "Has Leaves" and (not ok2 or remaining <= 0):
+                        continue
+                    if flt == "No Leaves" and (not ok2 or remaining > 0):
+                        continue
+                    total     = info["total"]     if ok2 else "N/A"
+                    used      = info["used"]      if ok2 else "N/A"
+                    remaining_val = info["remaining"] if ok2 else "N/A"
+                    rem_color = SUCCESS if ok2 and info["remaining"] > 0 else DANGER
+                    row = QWidget()
+                    row.setStyleSheet(f"background: {BG3}; border: 1px solid {BORDER}; border-radius: 6px;")
+                    rl  = QHBoxLayout(row); rl.setContentsMargins(10,8,10,8)
+                    for val, stretch, clr in [(emp["id"],1,TEXT2),(emp["name"],4,TEXT),(str(total),1,TEXT),(str(used),1,TEXT2),(str(remaining_val),1,rem_color)]:
+                        l = make_label(str(val), 12, clr); l.setAlignment(Qt.AlignmentFlag.AlignCenter)
+                        rl.addWidget(l, stretch)
+                    rows_l.addWidget(row)
+                    shown += 1
+                if shown == 0:
+                    rows_l.addWidget(make_label("No leave balances found for this filter.", 12, TEXT3))
+
+            def _failed(message):
+                clear_layout(rows_l)
+                rows_l.addWidget(make_label(f"Could not load leave balances: {message}", 12, DANGER))
+
+            run_background(self, _load_balances, _render, _failed)
 
         def do_set():
             eid = id_e.text().strip(); lv = leaves_e.text().strip()
@@ -2602,7 +3213,8 @@ class AdminDashboard(QWidget):
             if ok2: id_e.clear(); leaves_e.clear(); _reload()
 
         btn.clicked.connect(do_set)
-        _reload()
+        show_layout_loading(rows_l, "Loading leave balances...", columns=5, rows=7)
+        QTimer.singleShot(0, _reload)
         return page
 
     # Shift Management
@@ -2692,30 +3304,38 @@ class AdminDashboard(QWidget):
         lay.addStretch()
 
         def _reload():
-            while rows_l.count():
-                item = rows_l.takeAt(0)
-                if item.widget(): item.widget().setParent(None)
-            assignments = sorted(get_all_shift_assignments(), key=lambda a: int(a["emp_id"]) if str(a["emp_id"]).isdigit() else 0)
-            if not assignments:
-                rows_l.addWidget(make_label("No employees found.", 12, TEXT3)); return
-            for i, a in enumerate(assignments):
-                row = QWidget()
-                row.setStyleSheet(f"background: {'#faf7f2' if i%2==0 else '#f5f0e8'}; border: 1px solid {BORDER}; border-radius: 5px;")
-                rl = QHBoxLayout(row); rl.setContentsMargins(6,8,6,8)
-                shift = a["shift"]
-                shift_color = SHIFT_COLORS.get(shift, TEXT2)
-                hours_label = f"{SHIFTS[shift].get('hours', '?')} hrs  ({SHIFTS[shift]['start']} to {SHIFTS[shift]['end']})" if shift in SHIFTS else "N/A"
-                for val, stretch, clr in [
-                    (a["emp_id"], 1, TEXT2),
-                    (a["name"],   3, TEXT),
-                    (a["department"], 3, TEXT2),
-                    (shift,       3, shift_color),
-                    (hours_label, 1, TEXT3),
-                    (display_date(a["assigned_on"]), 1, TEXT3),
-                ]:
-                    l = make_label(str(val), 12, clr); l.setAlignment(Qt.AlignmentFlag.AlignCenter)
-                    rl.addWidget(l, stretch)
-                rows_l.addWidget(row)
+            show_layout_loading(rows_l, "Loading shift assignments...", columns=len(COLS), rows=7)
+
+            def _render(assignments):
+                assignments = sorted(assignments, key=lambda a: int(a["emp_id"]) if str(a["emp_id"]).isdigit() else 0)
+                clear_layout(rows_l)
+                if not assignments:
+                    rows_l.addWidget(make_label("No employees found.", 12, TEXT3)); return
+                for i, a in enumerate(assignments):
+                    row = QWidget()
+                    row.setStyleSheet(f"background: {'#faf7f2' if i%2==0 else '#f5f0e8'}; border: 1px solid {BORDER}; border-radius: 5px;")
+                    rl = QHBoxLayout(row); rl.setContentsMargins(6,8,6,8)
+                    shift = a["shift"]
+                    shift_color = SHIFT_COLORS.get(shift, TEXT2)
+                    hours_label = f"{SHIFTS[shift].get('hours', '?')} hrs  ({SHIFTS[shift]['start']} to {SHIFTS[shift]['end']})" if shift in SHIFTS else "N/A"
+                    for val, stretch, clr in [
+                        (a["emp_id"], 1, TEXT2),
+                        (a["name"],   3, TEXT),
+                        (a["department"], 3, TEXT2),
+                        (shift,       3, shift_color),
+                        (hours_label, 1, TEXT3),
+                        (display_date(a["assigned_on"]), 1, TEXT3),
+                    ]:
+                        l = make_label(str(val), 12, clr); l.setAlignment(Qt.AlignmentFlag.AlignCenter)
+                        rl.addWidget(l, stretch)
+                    rows_l.addWidget(row)
+
+            def _failed(message):
+                clear_layout(rows_l)
+                rows_l.addWidget(make_label(f"Could not load shifts: {message}", 12, DANGER))
+
+            run_background(self, get_all_shift_assignments, _render, _failed)
+            return
 
         def _open_sunday_calendar():
             dlg = QDialog(self)
@@ -2837,7 +3457,8 @@ class AdminDashboard(QWidget):
         btn_assign.clicked.connect(do_assign)
         sunday_date_btn.clicked.connect(_open_sunday_calendar)
         approve_sunday_btn.clicked.connect(do_approve_sunday)
-        _reload()
+        show_layout_loading(rows_l, "Loading shift assignments...", columns=len(COLS), rows=7)
+        QTimer.singleShot(0, _reload)
         return page
 
     # Monthly Attendance Report
@@ -2955,15 +3576,13 @@ class AdminDashboard(QWidget):
             month, year = _selected_month_year()
             if month is None:
                 return None
-            return attendance.get_monthly_attendance_report(month, year)
+            return self._cached_monthly_attendance_report(month, year)
 
         def _reload():
-            while rows_l.count():
-                item = rows_l.takeAt(0)
-                if item.widget(): item.widget().setParent(None)
-
-            report = _get_report()
-            if report is None:
+            show_layout_loading(rows_l, "Calculating monthly report...", columns=14, rows=7)
+            month, year = _selected_month_year()
+            if month is None:
+                clear_layout(rows_l)
                 total_emp_lbl.setText("0")
                 present_lbl.setText("0")
                 halfday_lbl.setText("0")
@@ -2973,54 +3592,62 @@ class AdminDashboard(QWidget):
                 msg_lbl.setStyleSheet(f"color:{DANGER};font-size:12px;")
                 return
 
-            total_emp_lbl.setText(str(len(report)))
-            eligible_days = sum(r["eligible_days"] for r in report)
-            present_days = sum(r["present"] + r["late"] for r in report)
-            half_days = sum(r["half_day"] for r in report)
-            absent_days = sum(r["absent"] + r.get("missed_checkout", 0) for r in report)
-            attendance_credit = present_days + (half_days * 0.5)
-            avg_att = round((attendance_credit / eligible_days) * 100, 2) if eligible_days else 0
-            present_lbl.setText(str(present_days))
-            halfday_lbl.setText(str(half_days))
-            absent_lbl.setText(str(absent_days))
-            avg_lbl.setText(f"{avg_att}%")
+            def _render(report):
+                clear_layout(rows_l)
+                total_emp_lbl.setText(str(len(report)))
+                eligible_days = sum(r["eligible_days"] for r in report)
+                present_days = sum(r["present"] + r["late"] for r in report)
+                half_days = sum(r["half_day"] for r in report)
+                absent_days = sum(r["absent"] + r.get("missed_checkout", 0) for r in report)
+                attendance_credit = present_days + (half_days * 0.5)
+                avg_att = round((attendance_credit / eligible_days) * 100, 2) if eligible_days else 0
+                present_lbl.setText(str(present_days))
+                halfday_lbl.setText(str(half_days))
+                absent_lbl.setText(str(absent_days))
+                avg_lbl.setText(f"{avg_att}%")
 
-            if not report:
-                rows_l.addWidget(make_label(f"No employees found for {_month_label()}.", 12, TEXT3))
-                msg_lbl.setText("")
-                return
+                if not report:
+                    rows_l.addWidget(make_label(f"No employees found for {_month_label()}.", 12, TEXT3))
+                    msg_lbl.setText("")
+                    return
 
-            msg_lbl.setText(f"Showing {len(report)} employees for {_month_label()}.")
-            msg_lbl.setStyleSheet(f"color:{TEXT2};font-size:12px;")
+                msg_lbl.setText(f"Showing {len(report)} employees for {_month_label()}.")
+                msg_lbl.setStyleSheet(f"color:{TEXT2};font-size:12px;")
 
-            report.sort(key=lambda r: int(r["emp_id"]) if str(r["emp_id"]).isdigit() else 0)
-            for i, rec in enumerate(report):
-                pct = rec["attendance_percentage"]
-                pct_color = SUCCESS if pct >= 90 else ("#f0a500" if pct >= 75 else DANGER)
-                row = QWidget()
-                row.setStyleSheet(f"background: {'#faf7f2' if i%2==0 else '#f5f0e8'}; border:1px solid {BORDER}; border-radius:5px;")
-                row.setMinimumHeight(46)
-                row.setMinimumWidth(table_min_width)
-                rl = QHBoxLayout(row); rl.setContentsMargins(8,10,8,10); rl.setSpacing(0)
-                values = [
-                    (rec["emp_id"], TEXT2),
-                    (rec["name"], TEXT),
-                    (rec["department"], TEXT2),
-                    (rec["eligible_days"], TEXT),
-                    (rec["not_marked"], DANGER if rec["not_marked"] else TEXT3),
-                    (rec["present"], SUCCESS if rec["present"] else TEXT3),
-                    (rec["late"], "#f0a500" if rec["late"] else TEXT3),
-                    (rec["half_day"], "#3498db" if rec["half_day"] else TEXT3),
-                    (rec["absent"], DANGER if rec["absent"] else TEXT3),
-                    (rec.get("missed_checkout", 0), DANGER if rec.get("missed_checkout", 0) else TEXT3),
-                    (rec["total_late_hours"], "#f0a500" if rec["total_late_hours"] else TEXT3),
-                    (rec["total_hours_worked"], TEXT2),
-                    (rec["total_overtime_hours"], SUCCESS if rec["total_overtime_hours"] else TEXT3),
-                    (f"{pct}%", pct_color),
-                ]
-                for (val, clr), (_, width) in zip(values, COLUMNS):
-                    rl.addWidget(_cell(val, 12, clr, width=width))
-                rows_l.addWidget(row)
+                report.sort(key=lambda r: int(r["emp_id"]) if str(r["emp_id"]).isdigit() else 0)
+                for i, rec in enumerate(report):
+                    pct = rec["attendance_percentage"]
+                    pct_color = SUCCESS if pct >= 90 else ("#f0a500" if pct >= 75 else DANGER)
+                    row = QWidget()
+                    row.setStyleSheet(f"background: {'#faf7f2' if i%2==0 else '#f5f0e8'}; border:1px solid {BORDER}; border-radius:5px;")
+                    row.setMinimumHeight(46)
+                    row.setMinimumWidth(table_min_width)
+                    rl = QHBoxLayout(row); rl.setContentsMargins(8,10,8,10); rl.setSpacing(0)
+                    values = [
+                        (rec["emp_id"], TEXT2),
+                        (rec["name"], TEXT),
+                        (rec["department"], TEXT2),
+                        (rec["eligible_days"], TEXT),
+                        (rec["not_marked"], DANGER if rec["not_marked"] else TEXT3),
+                        (rec["present"], SUCCESS if rec["present"] else TEXT3),
+                        (rec["late"], "#f0a500" if rec["late"] else TEXT3),
+                        (rec["half_day"], "#3498db" if rec["half_day"] else TEXT3),
+                        (rec["absent"], DANGER if rec["absent"] else TEXT3),
+                        (rec.get("missed_checkout", 0), DANGER if rec.get("missed_checkout", 0) else TEXT3),
+                        (rec["total_late_hours"], "#f0a500" if rec["total_late_hours"] else TEXT3),
+                        (rec["total_hours_worked"], TEXT2),
+                        (rec["total_overtime_hours"], SUCCESS if rec["total_overtime_hours"] else TEXT3),
+                        (f"{pct}%", pct_color),
+                    ]
+                    for (val, clr), (_, width) in zip(values, COLUMNS):
+                        rl.addWidget(_cell(val, 12, clr, width=width))
+                    rows_l.addWidget(row)
+
+            def _failed(message):
+                clear_layout(rows_l)
+                rows_l.addWidget(make_label(f"Could not load monthly report: {message}", 12, DANGER))
+
+            run_background(self, lambda: self._cached_monthly_attendance_report(month, year), _render, _failed)
 
         def _export_csv():
             report = _get_report()
@@ -3066,7 +3693,8 @@ class AdminDashboard(QWidget):
         month_cb.currentIndexChanged.connect(lambda _: _reload())
         year_e.editingFinished.connect(_reload)
         export_btn.clicked.connect(_export_csv)
-        _reload()
+        show_layout_loading(rows_l, "Calculating monthly report...", columns=14, rows=7)
+        QTimer.singleShot(0, _reload)
         return page
 
     # Salary Report
@@ -3566,88 +4194,97 @@ class AdminDashboard(QWidget):
         lay.addWidget(scroll, 1)
 
         def _reload():
-            while rows_l.count():
-                item = rows_l.takeAt(0)
-                if item.widget(): item.widget().setParent(None)
+            show_layout_loading(rows_l, "Loading salary report...", columns=len(SALARY_COLUMNS), rows=7)
 
             ym = _selected_year_month()
             if not ym:
+                clear_layout(rows_l)
                 rows_l.addWidget(make_label("Enter a valid 4-digit year.", 12, DANGER))
                 return
             rules = _selected_ot_rules()
             if not rules:
+                clear_layout(rows_l)
                 rows_l.addWidget(make_label("Enter valid OT multiplier and OT minutes.", 12, DANGER))
                 return
             ot_multiplier, min_ot_minutes = rules
-            summaries = get_all_salary_summaries(
-                ym,
-                ot_multiplier=ot_multiplier,
-                min_ot_minutes=min_ot_minutes,
+
+            def _render(summaries):
+                clear_layout(rows_l)
+                summaries.sort(key=lambda s: int(s["emp_id"]) if str(s["emp_id"]).isdigit() else 0)
+                export_lbl.setText("Preview generated. Use Export CSV to save salary records.")
+                export_lbl.setStyleSheet(f"color:{TEXT3};font-size:12px;")
+
+                total_base   = sum(s["basic_salary"] for s in summaries)
+                total_deduct = sum(s.get("total_deductions", 0) for s in summaries if s.get("has_basic_salary"))
+                total_ot     = sum(s.get("gross_salary", 0) for s in summaries)
+                total_net    = sum(s["net_salary"] for s in summaries)
+
+                self._sal_total_lbl.setText(f"₹{total_base:,.0f}")
+                self._sal_deduct_lbl.setText(f"₹{total_deduct:,.2f}")
+                self._sal_ot_lbl.setText(f"₹{total_ot:,.2f}")
+                self._sal_net_lbl.setText(f"₹{total_net:,.2f}")
+
+                for i, s in enumerate(summaries):
+                    net_color = SUCCESS if s["net_salary"] >= s["basic_salary"] else (DANGER if s["net_salary"] < s["basic_salary"] * 0.9 else TEXT)
+                    row = QWidget()
+                    row.setStyleSheet(f"background: {'#faf7f2' if i%2==0 else '#f5f0e8'}; border:1px solid {BORDER}; border-radius:5px;")
+                    row.setMinimumHeight(46)
+                    row.setMinimumWidth(table_min_width)
+                    rl = QHBoxLayout(row); rl.setContentsMargins(8,10,8,10); rl.setSpacing(0)
+                    has_salary = bool(s.get("has_basic_salary"))
+
+                    def _money_or_blank(field):
+                        if not has_salary:
+                            return "---", TEXT3
+                        value = float(s.get(field, 0) or 0)
+                        return f"₹{value:,.2f}", DANGER if value > 0 else TEXT3
+
+                    late_ded = _money_or_blank("late_deduction")
+                    early_ded = _money_or_blank("early_exit_deduction")
+                    absent_ded = _money_or_blank("absent_deduction")
+                    half_ded = _money_or_blank("halfday_deduction")
+                    row_values = [
+                        (s["emp_id"], TEXT2),
+                        (s["name"], TEXT),
+                        (s["department"], TEXT2),
+                        (s["shift"], TEXT2),
+                        (f"₹{s['basic_salary']:,.0f}" if has_salary else "---", TEXT if has_salary else TEXT3),
+                        (str(s["days_present"]), SUCCESS),
+                        (str(s["days_absent"]), DANGER),
+                        (str(s.get("days_halfday", 0)), "#f0a500" if s.get("days_halfday", 0) > 0 else TEXT3),
+                        (str(s.get("missed_checkouts", 0)), DANGER if s.get("missed_checkouts", 0) > 0 else TEXT3),
+                        (str(s.get("total_late_hours", 0)), "#f0a500" if s.get("total_late_hours", 0) > 0 else TEXT3),
+                        late_ded,
+                        early_ded,
+                        absent_ded,
+                        half_ded,
+                        (str(s["total_ot_hours"]), SUCCESS if s["total_ot_hours"] > 0 else TEXT3),
+                        (f"₹{s['ot_pay']:,.2f}" if has_salary else "---", SUCCESS if s["ot_pay"] > 0 else TEXT3),
+                        (f"₹{s['net_salary']:,.2f}" if has_salary else "---", net_color if has_salary else TEXT3),
+                    ]
+                    for idx, ((val, clr), (_, width)) in enumerate(zip(row_values, SALARY_COLUMNS)):
+                        if idx == len(SALARY_COLUMNS) - 1:
+                            net_btn = QPushButton(str(val))
+                            net_btn.setCursor(QCursor(Qt.CursorShape.PointingHandCursor))
+                            net_btn.setFixedWidth(width)
+                            net_btn.setMinimumHeight(28)
+                            net_btn.setStyleSheet(f"QPushButton {{ background:transparent; color:{clr}; border:none; font-size:12px; font-weight:700; text-decoration: underline; }} QPushButton:hover {{ color:{ACCENT}; }}")
+                            net_btn.clicked.connect(lambda checked=False, summary=s: _show_salary_breakdown(summary))
+                            rl.addWidget(net_btn)
+                        else:
+                            rl.addWidget(_salary_cell(val, 12, clr, width=width))
+                    rows_l.addWidget(row)
+
+            def _failed(message):
+                clear_layout(rows_l)
+                rows_l.addWidget(make_label(f"Could not load salary report: {message}", 12, DANGER))
+
+            run_background(
+                self,
+                lambda: get_all_salary_summaries(ym, ot_multiplier=ot_multiplier, min_ot_minutes=min_ot_minutes),
+                _render,
+                _failed,
             )
-            summaries.sort(key=lambda s: int(s["emp_id"]) if str(s["emp_id"]).isdigit() else 0)
-            export_lbl.setText("Preview generated. Use Export CSV to save salary records.")
-            export_lbl.setStyleSheet(f"color:{TEXT3};font-size:12px;")
-
-            total_base   = sum(s["basic_salary"] for s in summaries)
-            total_deduct = sum(s.get("total_deductions", 0) for s in summaries if s.get("has_basic_salary"))
-            total_ot     = sum(s.get("gross_salary", 0) for s in summaries)
-            total_net    = sum(s["net_salary"] for s in summaries)
-
-            self._sal_total_lbl.setText(f"₹{total_base:,.0f}")
-            self._sal_deduct_lbl.setText(f"₹{total_deduct:,.2f}")
-            self._sal_ot_lbl.setText(f"₹{total_ot:,.2f}")
-            self._sal_net_lbl.setText(f"₹{total_net:,.2f}")
-
-            for i, s in enumerate(summaries):
-                net_color = SUCCESS if s["net_salary"] >= s["basic_salary"] else (DANGER if s["net_salary"] < s["basic_salary"] * 0.9 else TEXT)
-                row = QWidget()
-                row.setStyleSheet(f"background: {'#faf7f2' if i%2==0 else '#f5f0e8'}; border:1px solid {BORDER}; border-radius:5px;")
-                row.setMinimumHeight(46)
-                row.setMinimumWidth(table_min_width)
-                rl = QHBoxLayout(row); rl.setContentsMargins(8,10,8,10); rl.setSpacing(0)
-                has_salary = bool(s.get("has_basic_salary"))
-
-                def _money_or_blank(field):
-                    if not has_salary:
-                        return "---", TEXT3
-                    value = float(s.get(field, 0) or 0)
-                    return f"₹{value:,.2f}", DANGER if value > 0 else TEXT3
-
-                late_ded = _money_or_blank("late_deduction")
-                early_ded = _money_or_blank("early_exit_deduction")
-                absent_ded = _money_or_blank("absent_deduction")
-                half_ded = _money_or_blank("halfday_deduction")
-                row_values = [
-                    (s["emp_id"], TEXT2),
-                    (s["name"], TEXT),
-                    (s["department"], TEXT2),
-                    (s["shift"], TEXT2),
-                    (f"₹{s['basic_salary']:,.0f}" if has_salary else "---", TEXT if has_salary else TEXT3),
-                    (str(s["days_present"]), SUCCESS),
-                    (str(s["days_absent"]), DANGER),
-                    (str(s.get("days_halfday", 0)), "#f0a500" if s.get("days_halfday", 0) > 0 else TEXT3),
-                    (str(s.get("missed_checkouts", 0)), DANGER if s.get("missed_checkouts", 0) > 0 else TEXT3),
-                    (str(s.get("total_late_hours", 0)), "#f0a500" if s.get("total_late_hours", 0) > 0 else TEXT3),
-                    late_ded,
-                    early_ded,
-                    absent_ded,
-                    half_ded,
-                    (str(s["total_ot_hours"]), SUCCESS if s["total_ot_hours"] > 0 else TEXT3),
-                    (f"₹{s['ot_pay']:,.2f}" if has_salary else "---", SUCCESS if s["ot_pay"] > 0 else TEXT3),
-                    (f"₹{s['net_salary']:,.2f}" if has_salary else "---", net_color if has_salary else TEXT3),
-                ]
-                for idx, ((val, clr), (_, width)) in enumerate(zip(row_values, SALARY_COLUMNS)):
-                    if idx == len(SALARY_COLUMNS) - 1:
-                        net_btn = QPushButton(str(val))
-                        net_btn.setCursor(QCursor(Qt.CursorShape.PointingHandCursor))
-                        net_btn.setFixedWidth(width)
-                        net_btn.setMinimumHeight(28)
-                        net_btn.setStyleSheet(f"QPushButton {{ background:transparent; color:{clr}; border:none; font-size:12px; font-weight:700; text-decoration: underline; }} QPushButton:hover {{ color:{ACCENT}; }}")
-                        net_btn.clicked.connect(lambda checked=False, summary=s: _show_salary_breakdown(summary))
-                        rl.addWidget(net_btn)
-                    else:
-                        rl.addWidget(_salary_cell(val, 12, clr, width=width))
-                rows_l.addWidget(row)
 
         def _export_csv():
             ym = _selected_year_month()
@@ -3722,7 +4359,8 @@ class AdminDashboard(QWidget):
         month_cb.currentIndexChanged.connect(lambda _: _reload())
         year_e.editingFinished.connect(_reload)
         export_btn.clicked.connect(_export_csv)
-        _reload()
+        show_layout_loading(rows_l, "Loading salary report...", columns=len(SALARY_COLUMNS), rows=7)
+        QTimer.singleShot(0, _reload)
         return page
 
     # Daily Report
@@ -3876,40 +4514,46 @@ class AdminDashboard(QWidget):
             return qdate_iso(date_filter.date())
 
         def _reload():
-            while rows_l.count():
-                item = rows_l.takeAt(0)
-                if item.widget(): item.widget().setParent(None)
             selected = _selected_date()
             selected_date_lbl.setText(f"Selected date: {display_date(selected)}")
             summary_title.setText(f"Summary for {display_date(selected)}")
             export_lbl.clear()
-            report = get_daily_report(selected)
-            if not report:
-                rows_l.addWidget(make_label("No employees found.", 12, TEXT3)); return
-            report.sort(key=lambda r: int(r["id"]) if str(r["id"]).isdigit() else 0)
-            for rec in report:
-                status = rec["status"]
-                row = QWidget()
-                row.setStyleSheet(f"background: {BG3}; border: 1px solid {BORDER}; border-radius: 6px;")
-                row.setMinimumWidth(daily_table_width)
-                row.setMinimumHeight(46)
-                rl  = QHBoxLayout(row); rl.setContentsMargins(8,8,8,8); rl.setSpacing(0)
-                vals = [
-                    (rec["id"], TEXT2),
-                    (rec["name"], TEXT),
-                    (rec.get("department", "N/A"), TEXT2),
-                    (rec.get("shift", "N/A"), TEXT2),
-                    (status, STATUS_CLR.get(status, TEXT)),
-                    (rec.get("checkin_time", "-"), TEXT2),
-                    (rec.get("checkout_time", "-"), TEXT2),
-                    (rec.get("hours_worked", 0), TEXT2),
-                    (rec.get("late_hours", 0), "#f0a500" if rec.get("late_hours", 0) else TEXT3),
-                    (rec.get("overtime_hours", 0), SUCCESS if rec.get("overtime_hours", 0) else TEXT3),
-                    (rec.get("marked_by", "-"), TEXT3),
-                ]
-                for (val, clr), (_, width) in zip(vals, DAILY_COLUMNS):
-                    rl.addWidget(_daily_cell(val, 12, clr, width=width))
-                rows_l.addWidget(row)
+            show_layout_loading(rows_l, "Loading daily report...", columns=len(DAILY_COLUMNS), rows=7)
+
+            def _render(report):
+                clear_layout(rows_l)
+                if not report:
+                    rows_l.addWidget(make_label("No employees found.", 12, TEXT3)); return
+                report.sort(key=lambda r: int(r["id"]) if str(r["id"]).isdigit() else 0)
+                for rec in report:
+                    status = rec["status"]
+                    row = QWidget()
+                    row.setStyleSheet(f"background: {BG3}; border: 1px solid {BORDER}; border-radius: 6px;")
+                    row.setMinimumWidth(daily_table_width)
+                    row.setMinimumHeight(46)
+                    rl  = QHBoxLayout(row); rl.setContentsMargins(8,8,8,8); rl.setSpacing(0)
+                    vals = [
+                        (rec["id"], TEXT2),
+                        (rec["name"], TEXT),
+                        (rec.get("department", "N/A"), TEXT2),
+                        (rec.get("shift", "N/A"), TEXT2),
+                        (status, STATUS_CLR.get(status, TEXT)),
+                        (rec.get("checkin_time", "-"), TEXT2),
+                        (rec.get("checkout_time", "-"), TEXT2),
+                        (rec.get("hours_worked", 0), TEXT2),
+                        (rec.get("late_hours", 0), "#f0a500" if rec.get("late_hours", 0) else TEXT3),
+                        (rec.get("overtime_hours", 0), SUCCESS if rec.get("overtime_hours", 0) else TEXT3),
+                        (rec.get("marked_by", "-"), TEXT3),
+                    ]
+                    for (val, clr), (_, width) in zip(vals, DAILY_COLUMNS):
+                        rl.addWidget(_daily_cell(val, 12, clr, width=width))
+                    rows_l.addWidget(row)
+
+            def _failed(message):
+                clear_layout(rows_l)
+                rows_l.addWidget(make_label(f"Could not load daily report: {message}", 12, DANGER))
+
+            run_background(self, lambda: get_daily_report(selected), _render, _failed)
 
         def do_export():
             selected = _selected_date()
@@ -4007,7 +4651,8 @@ class AdminDashboard(QWidget):
         date_filter_btn.clicked.connect(_open_date_filter_calendar)
         today_btn.clicked.connect(_show_today)
         export_btn.clicked.connect(do_export)
-        _reload()
+        show_layout_loading(rows_l, "Loading daily report...", columns=len(DAILY_COLUMNS), rows=7)
+        QTimer.singleShot(0, _reload)
         return page
 
     # Leave Requests
@@ -4093,19 +4738,28 @@ class AdminDashboard(QWidget):
         lay.addWidget(table_box); lay.addStretch()
 
         def _reload():
-            while rows_l.count():
-                item = rows_l.takeAt(0)
-                if item.widget(): item.widget().setParent(None)
+            show_layout_loading(rows_l, "Loading leave requests...", columns=11, rows=7)
             flt     = self._lr_filter
             type_flt = self._lr_type_cb.currentText()
-            records = get_leave_requests()
-            if flt != "All":
-                records = [r for r in records if r["status"] == flt]
-            if type_flt != "All":
-                records = [r for r in records if r.get("leave_type", "") == type_flt]
-            if not records:
-                rows_l.addWidget(make_label("No requests found.", 12, TEXT3)); return
-            for i, req in enumerate(records):
+
+            def _render(records):
+                if flt != "All":
+                    records = [r for r in records if r["status"] == flt]
+                if type_flt != "All":
+                    records = [r for r in records if r.get("leave_type", "") == type_flt]
+                clear_layout(rows_l)
+                if not records:
+                    rows_l.addWidget(make_label("No requests found.", 12, TEXT3)); return
+                for i, req in enumerate(records):
+                    _add_leave_row(i, req)
+
+            def _failed(message):
+                clear_layout(rows_l)
+                rows_l.addWidget(make_label(f"Could not load leave requests: {message}", 12, DANGER))
+
+            run_background(self, get_leave_requests, _render, _failed)
+
+        def _add_leave_row(i, req):
                 row = QWidget()
                 row.setStyleSheet(f"background: {'#faf7f2' if i%2==0 else '#f5f0e8'}; border: 1px solid {BORDER}; border-radius: 5px;")
                 row.setMinimumHeight(52)
@@ -4288,7 +4942,8 @@ class AdminDashboard(QWidget):
             fb.clicked.connect(lambda _, v=val: _set_filter(v))
         self._lr_type_cb.currentIndexChanged.connect(lambda _: _reload())
 
-        _reload()
+        show_layout_loading(rows_l, "Loading leave requests...", columns=11, rows=7)
+        QTimer.singleShot(0, _reload)
         return page
 
 
@@ -4318,7 +4973,7 @@ class EmployeeDashboard(QWidget):
         ]
         nav_items = [
             ("dashboard",     "aSz", "Dashboard"),
-        ]
+        ] + [(key, icon_name, short_label) for key, icon_name, short_label, _ in self._feature_items]
         self._sidebar = Sidebar(nav_items, self._show_page, self.controller.show_login, "MY ACCOUNT")
         lay.addWidget(self._sidebar)
 
@@ -4329,13 +4984,52 @@ class EmployeeDashboard(QWidget):
         self._pages = {}
         self._sidebar.select("dashboard")
 
+    def _loading_spec(self, key):
+        return {
+            "profile": ("My Profile", "Your account and notifications", "Loading profile...", 5, 4, [92, (44, 44, 44)]),
+            "attendance": ("Attendance", "Mark and review attendance", "Loading attendance...", 8, 5, [118, 34]),
+            "monthly_report": ("Monthly Report", "Your monthly attendance summary", "Calculating monthly report...", 10, 7, [38, (76, 76, 76, 76)]),
+            "leaves": ("Leave Balance", "Your leave balance", "Loading leave balance...", 6, 5, [(80, 80, 80), 92]),
+            "request_leave": ("Request Leave", "Submit and review leave requests", "Loading leave history...", 9, 7, [250, 122]),
+        }.get(key)
+
+    def _replace_loading_page(self, key, loading_page):
+        if self._pages.get(key) is not loading_page:
+            return
+        if getattr(self._stack, "_animating", False):
+            QTimer.singleShot(40, lambda k=key, p=loading_page: self._replace_loading_page(k, p))
+            return
+        real_page = self._build_page(key)
+        self._pages[key] = real_page
+        self._stack.addWidget(real_page)
+        if self._stack.currentWidget() is loading_page:
+            self._stack.fade_replace_current(real_page, loading_page)
+        else:
+            self._remove_loading_widget(loading_page)
+
+    def _remove_loading_widget(self, widget):
+        try:
+            if getattr(self._stack, "_animating", False):
+                QTimer.singleShot(50, lambda w=widget: self._remove_loading_widget(w))
+                return
+            if self._stack.indexOf(widget) != -1 and self._stack.currentWidget() is not widget:
+                self._stack.removeWidget(widget)
+                widget.deleteLater()
+        except RuntimeError:
+            pass
+
     def _show_page(self, key):
-        # BUG FIX: always rebuild salary_report so updated basic salaries are never stale
-        if key == "salary_report" and key in self._pages:
-            old = self._pages.pop(key)
-            self._stack.removeWidget(old)
-            old.deleteLater()
         if key not in self._pages:
+            loading_spec = self._loading_spec(key)
+            if loading_spec:
+                title, subtitle, message, columns, rows, *rest = loading_spec
+                blocks = rest[0] if rest else None
+                page = make_table_loading_page(title, subtitle, message, columns=columns, rows=rows, blocks=blocks)
+                self._pages[key] = page
+                self._stack.addWidget(page)
+                self._stack.slide_to(page)
+                QTimer.singleShot(220, lambda k=key, p=page: self._replace_loading_page(k, p))
+                return
             page = self._build_page(key)
             self._pages[key] = page
             self._stack.addWidget(page)
@@ -4449,7 +5143,7 @@ class EmployeeDashboard(QWidget):
                 mark_notification_read(item.get("id"), emp_id)
                 _reload_notifications()
 
-        def _reload_notifications():
+        def _clear_notifications():
             while nl.count():
                 item = nl.takeAt(0)
                 if item.widget():
@@ -4460,10 +5154,12 @@ class EmployeeDashboard(QWidget):
                         if child.widget():
                             child.widget().setParent(None)
 
+        def _render_notifications(result):
+            unread_count, notifications = result
+            _clear_notifications()
             header_row = QHBoxLayout()
             header_row.addWidget(make_label("Notifications", 14, TEXT, bold=True))
             header_row.addStretch()
-            unread_count = get_unread_notification_count(emp_id) if emp_id is not None else 0
             unread_lbl = QLabel(f" {unread_count} unread ")
             unread_lbl.setStyleSheet(f"""
                 background: {'#fee2e2' if unread_count else BG};
@@ -4477,7 +5173,6 @@ class EmployeeDashboard(QWidget):
             header_row.addWidget(unread_lbl)
             nl.addLayout(header_row)
 
-            notifications = get_employee_notifications(emp_id, limit=5) if emp_id is not None else []
             if notifications:
                 for item in notifications:
                     item_box = QFrame()
@@ -4506,6 +5201,33 @@ class EmployeeDashboard(QWidget):
                     nl.addWidget(item_box)
             else:
                 nl.addWidget(make_label("No notifications yet.", 12, TEXT3))
+
+        def _reload_notifications():
+            _clear_notifications()
+            header_row = QHBoxLayout()
+            header_row.addWidget(make_label("Notifications", 14, TEXT, bold=True))
+            header_row.addStretch()
+            header_row.addWidget(make_label("Loading...", 11, TEXT3, bold=True))
+            nl.addLayout(header_row)
+            for _ in range(3):
+                nl.addWidget(make_outline_placeholder(44))
+            app = QApplication.instance()
+            if app is not None:
+                app.processEvents()
+
+            def _load_notifications():
+                if emp_id is None:
+                    return 0, []
+                return (
+                    get_unread_notification_count(emp_id),
+                    get_employee_notifications(emp_id, limit=5),
+                )
+
+            def _failed_notifications(message):
+                _clear_notifications()
+                nl.addWidget(make_label(f"Could not load notifications: {message}", 12, DANGER))
+
+            run_background(self, _load_notifications, _render_notifications, _failed_notifications)
 
         _reload_notifications()
 
@@ -4592,22 +5314,35 @@ class EmployeeDashboard(QWidget):
             if emp_id is None:
                 labels["Status"].setText("Could not resolve Employee ID")
                 labels["Status"].setStyleSheet(f"color: {DANGER}; font-size: 13px; font-weight: 700;"); return
-            rec = attendance.get_today_record(emp_id)
-            if rec:
-                st  = rec.get("status","N/A"); arr = rec.get("arrival_time") or "N/A"
-                co  = rec.get("checkout_time") or "N/A"; hrs = rec.get("hours_worked"); lte = rec.get("late_minutes",0)
-                labels["Status"].setText(st);           labels["Status"].setStyleSheet(f"color:{STATUS_CLR.get(st,TEXT)};font-size:13px;font-weight:700;")
-                labels["Check-In"].setText(arr);        labels["Check-In"].setStyleSheet(f"color:{TEXT};font-size:13px;font-weight:700;")
-                labels["Check-Out"].setText(co);        labels["Check-Out"].setStyleSheet(f"color:{TEXT};font-size:13px;font-weight:700;")
-                labels["Hours Worked"].setText(f"{hrs}h" if hrs else "N/A")
-                labels["Late Minutes"].setText(str(lte))
-                btn_in.setEnabled(arr == "N/A")
-                btn_out.setEnabled(co == "N/A" and arr != "N/A")
-            else:
-                labels["Status"].setText("Not marked yet"); labels["Status"].setStyleSheet(f"color:{TEXT3};font-size:13px;")
-                for k in ("Check-In","Check-Out","Hours Worked"): labels[k].setText("N/A")
-                labels["Late Minutes"].setText("0")
-                btn_in.setEnabled(True); btn_out.setEnabled(False)
+            labels["Status"].setText("Loading...")
+            labels["Status"].setStyleSheet(f"color:{TEXT3};font-size:13px;font-weight:700;")
+            btn_in.setEnabled(False)
+            btn_out.setEnabled(False)
+
+            def _render(rec):
+                if rec:
+                    st  = rec.get("status","N/A"); arr = rec.get("arrival_time") or "N/A"
+                    co  = rec.get("checkout_time") or "N/A"; hrs = rec.get("hours_worked"); lte = rec.get("late_minutes",0)
+                    labels["Status"].setText(st);           labels["Status"].setStyleSheet(f"color:{STATUS_CLR.get(st,TEXT)};font-size:13px;font-weight:700;")
+                    labels["Check-In"].setText(arr);        labels["Check-In"].setStyleSheet(f"color:{TEXT};font-size:13px;font-weight:700;")
+                    labels["Check-Out"].setText(co);        labels["Check-Out"].setStyleSheet(f"color:{TEXT};font-size:13px;font-weight:700;")
+                    labels["Hours Worked"].setText(f"{hrs}h" if hrs else "N/A")
+                    labels["Late Minutes"].setText(str(lte))
+                    btn_in.setEnabled(arr == "N/A")
+                    btn_out.setEnabled(co == "N/A" and arr != "N/A")
+                else:
+                    labels["Status"].setText("Not marked yet"); labels["Status"].setStyleSheet(f"color:{TEXT3};font-size:13px;")
+                    for k in ("Check-In","Check-Out","Hours Worked"): labels[k].setText("N/A")
+                    labels["Late Minutes"].setText("0")
+                    btn_in.setEnabled(True); btn_out.setEnabled(False)
+
+            def _failed(message):
+                labels["Status"].setText("Could not load")
+                labels["Status"].setStyleSheet(f"color:{DANGER};font-size:13px;font-weight:700;")
+                msg_lbl.setText(message)
+                msg_lbl.setStyleSheet(f"color:{DANGER};font-size:12px;")
+
+            run_background(self, lambda: attendance.get_today_record(emp_id), _render, _failed)
 
         def do_checkin():
             if emp_id is None: return
@@ -4722,70 +5457,85 @@ class EmployeeDashboard(QWidget):
             return month_cb.currentIndex() + 1, int(year)
 
         def _reload():
-            while rows_l.count():
-                item = rows_l.takeAt(0)
-                if item.widget(): item.widget().setParent(None)
-
             month, year = _selected_month_year()
             if month is None:
+                clear_layout(rows_l)
                 msg_lbl.setText("Error: Enter a valid 4-digit year.")
                 msg_lbl.setStyleSheet(f"color:{DANGER};font-size:12px;")
                 return
 
             prefix = f"{year}-{month:02d}"
-            report_rows = attendance.get_monthly_attendance_report(month, year)
-            summary = next((r for r in report_rows if r.get("emp_id") == emp_id), None)
-            if not summary:
-                summary = {
-                    "recorded_days": 0, "present": 0, "late": 0,
-                    "half_day": 0, "absent": 0, "missed_checkout": 0,
-                    "attendance_percentage": 0,
-                }
-
-            present_lbl.setText(str(summary.get("present", 0) + summary.get("late", 0)))
-            halfday_lbl.setText(str(summary.get("half_day", 0)))
-            absent_lbl.setText(str(
-                summary.get("absent", 0) + summary.get("missed_checkout", 0)
-            ))
-            pct = summary.get("attendance_percentage", 0)
-            pct_lbl.setText(f"{pct}%")
-            pct_lbl.setStyleSheet(f"color:{SUCCESS if pct >= 90 else ('#f0a500' if pct >= 75 else DANGER)};font-size:26px;font-weight:700;background:transparent;border:none;")
-
-            records = [
-                r for r in attendance.get_attendance_by_employee(emp_id)
-                if str(r.get("date", "")).startswith(prefix)
-            ]
-            records.sort(key=lambda r: r.get("date", ""), reverse=True)
-            msg_lbl.setText(f"Showing {len(records)} records for {month_cb.currentText()} {year}.")
+            msg_lbl.setText(f"Loading {month_cb.currentText()} {year}...")
             msg_lbl.setStyleSheet(f"color:{TEXT2};font-size:12px;")
+            show_layout_loading(rows_l, "Loading monthly report...", columns=len(COLS), rows=7)
 
-            if not records:
-                rows_l.addWidget(make_label("No attendance records found for this month.", 12, TEXT3))
-                return
-
-            status_colors = {"Present": SUCCESS, "Late": "#f0a500", "Half-Day": "#3498db", "Absent": DANGER}
-            for i, rec in enumerate(records):
-                status = rec.get("status", "N/A")
-                display_status = "Missed Checkout" if attendance.is_missed_checkout(rec) else status
-                status_color = DANGER if display_status == "Missed Checkout" else status_colors.get(status, TEXT2)
-                row = QWidget()
-                row.setStyleSheet(f"background: {'#faf7f2' if i%2==0 else '#f5f0e8'}; border:1px solid {BORDER}; border-radius:5px;")
-                row.setMinimumHeight(46)
-                row.setMinimumWidth(table_min_width)
-                rl = QHBoxLayout(row); rl.setContentsMargins(8,10,8,10); rl.setSpacing(0)
-                late_hours = round(float(rec.get("late_minutes") or 0) / 60, 2)
-                values = [
-                    (display_date(rec.get("date", "")), TEXT2),
-                    (display_status, status_color),
-                    (rec.get("arrival_time") or "N/A", TEXT2),
-                    (rec.get("checkout_time") or "N/A", TEXT2),
-                    (rec.get("hours_worked") or 0, TEXT2),
-                    (late_hours, "#f0a500" if late_hours else TEXT3),
-                    (rec.get("overtime_hours") or 0, SUCCESS if rec.get("overtime_hours") else TEXT3),
+            def _load_report():
+                report_rows = attendance.get_monthly_attendance_report(month, year)
+                records = [
+                    r for r in attendance.get_attendance_by_employee(emp_id)
+                    if str(r.get("date", "")).startswith(prefix)
                 ]
-                for (val, clr), (_, width) in zip(values, COLS):
-                    rl.addWidget(_cell(val, 12, clr, width=width))
-                rows_l.addWidget(row)
+                return report_rows, records
+
+            def _render(result):
+                report_rows, records = result
+                clear_layout(rows_l)
+
+                summary = next((r for r in report_rows if r.get("emp_id") == emp_id), None)
+                if not summary:
+                    summary = {
+                        "recorded_days": 0, "present": 0, "late": 0,
+                        "half_day": 0, "absent": 0, "missed_checkout": 0,
+                        "attendance_percentage": 0,
+                    }
+
+                present_lbl.setText(str(summary.get("present", 0) + summary.get("late", 0)))
+                halfday_lbl.setText(str(summary.get("half_day", 0)))
+                absent_lbl.setText(str(
+                    summary.get("absent", 0) + summary.get("missed_checkout", 0)
+                ))
+                pct = summary.get("attendance_percentage", 0)
+                pct_lbl.setText(f"{pct}%")
+                pct_lbl.setStyleSheet(f"color:{SUCCESS if pct >= 90 else ('#f0a500' if pct >= 75 else DANGER)};font-size:26px;font-weight:700;background:transparent;border:none;")
+
+                records.sort(key=lambda r: r.get("date", ""), reverse=True)
+                msg_lbl.setText(f"Showing {len(records)} records for {month_cb.currentText()} {year}.")
+                msg_lbl.setStyleSheet(f"color:{TEXT2};font-size:12px;")
+
+                if not records:
+                    rows_l.addWidget(make_label("No attendance records found for this month.", 12, TEXT3))
+                    return
+
+                status_colors = {"Present": SUCCESS, "Late": "#f0a500", "Half-Day": "#3498db", "Absent": DANGER}
+                for i, rec in enumerate(records):
+                    status = rec.get("status", "N/A")
+                    display_status = "Missed Checkout" if attendance.is_missed_checkout(rec) else status
+                    status_color = DANGER if display_status == "Missed Checkout" else status_colors.get(status, TEXT2)
+                    row = QWidget()
+                    row.setStyleSheet(f"background: {'#faf7f2' if i%2==0 else '#f5f0e8'}; border:1px solid {BORDER}; border-radius:5px;")
+                    row.setMinimumHeight(46)
+                    row.setMinimumWidth(table_min_width)
+                    rl = QHBoxLayout(row); rl.setContentsMargins(8,10,8,10); rl.setSpacing(0)
+                    late_hours = round(float(rec.get("late_minutes") or 0) / 60, 2)
+                    values = [
+                        (display_date(rec.get("date", "")), TEXT2),
+                        (display_status, status_color),
+                        (rec.get("arrival_time") or "N/A", TEXT2),
+                        (rec.get("checkout_time") or "N/A", TEXT2),
+                        (rec.get("hours_worked") or 0, TEXT2),
+                        (late_hours, "#f0a500" if late_hours else TEXT3),
+                        (rec.get("overtime_hours") or 0, SUCCESS if rec.get("overtime_hours") else TEXT3),
+                    ]
+                    for (val, clr), (_, width) in zip(values, COLS):
+                        rl.addWidget(_cell(val, 12, clr, width=width))
+                    rows_l.addWidget(row)
+
+            def _failed(message):
+                clear_layout(rows_l)
+                msg_lbl.setText(f"Could not load monthly report: {message}")
+                msg_lbl.setStyleSheet(f"color:{DANGER};font-size:12px;")
+
+            run_background(self, _load_report, _render, _failed)
 
         month_cb.currentIndexChanged.connect(lambda _: _reload())
         year_e.editingFinished.connect(_reload)
@@ -4807,31 +5557,54 @@ class EmployeeDashboard(QWidget):
             lay.addWidget(make_label("Error: Could not resolve your Employee ID.", 13, DANGER))
             lay.addStretch(); return page
 
-        ok, info = get_employee_leaves(emp_id)
-        total     = info["total"]     if ok else "N/A"
-        used      = info["used"]      if ok else "N/A"
-        remaining = info["remaining"] if ok else "N/A"
-        rem_color = SUCCESS if ok and info["remaining"] > 0 else DANGER
+        body = QWidget(); body.setStyleSheet("background: transparent;")
+        body_l = QVBoxLayout(body); body_l.setContentsMargins(0,0,0,0); body_l.setSpacing(16)
+        lay.addWidget(body)
 
-        cards_row = QHBoxLayout(); cards_row.setSpacing(10)
-        for num, lbl_text, clr in [(total,"Total Leaves",TEXT),(used,"Used Leaves",TEXT2),(remaining,"Remaining Leaves",rem_color)]:
-            card = card_frame(10)
-            cl = QVBoxLayout(card); cl.setContentsMargins(16,18,16,18); cl.setSpacing(4)
-            cl.addWidget(make_label(str(num), 34, clr, bold=True), alignment=Qt.AlignmentFlag.AlignCenter)
-            cl.addWidget(make_label(lbl_text, 11, TEXT3),           alignment=Qt.AlignmentFlag.AlignCenter)
-            cards_row.addWidget(card)
-        lay.addLayout(cards_row); lay.addSpacing(16)
+        def _show_leaves_loading():
+            clear_layout(body_l)
+            cards_row = QHBoxLayout(); cards_row.setSpacing(10)
+            for _ in range(3):
+                cards_row.addWidget(make_outline_placeholder(104))
+            body_l.addLayout(cards_row)
+            body_l.addWidget(make_outline_placeholder(58))
+            app = QApplication.instance()
+            if app is not None:
+                app.processEvents()
 
-        note = card_frame(8)
-        nl = QVBoxLayout(note); nl.setContentsMargins(16,14,16,14)
-        if ok and remaining == 0:
-            nl.addWidget(make_label("Warning: You have no remaining leaves. Any future absence will be unpaid.", 12, DANGER))
-        elif not ok:
-            nl.addWidget(make_label("Info: No leave record found. Ask your admin to set your leave balance.", 12, TEXT3))
-        else:
-            nl.addWidget(make_label(f"Info: You have used {used} out of {total} leaves. {remaining} remaining.", 12, TEXT2))
-        lay.addWidget(note); lay.addSpacing(16)
+        def _render_leaves(result):
+            ok, info = result
+            clear_layout(body_l)
+            total     = info["total"]     if ok else "N/A"
+            used      = info["used"]      if ok else "N/A"
+            remaining = info["remaining"] if ok else "N/A"
+            rem_color = SUCCESS if ok and info["remaining"] > 0 else DANGER
 
+            cards_row = QHBoxLayout(); cards_row.setSpacing(10)
+            for num, lbl_text, clr in [(total,"Total Leaves",TEXT),(used,"Used Leaves",TEXT2),(remaining,"Remaining Leaves",rem_color)]:
+                card = card_frame(10)
+                cl = QVBoxLayout(card); cl.setContentsMargins(16,18,16,18); cl.setSpacing(4)
+                cl.addWidget(make_label(str(num), 34, clr, bold=True), alignment=Qt.AlignmentFlag.AlignCenter)
+                cl.addWidget(make_label(lbl_text, 11, TEXT3),           alignment=Qt.AlignmentFlag.AlignCenter)
+                cards_row.addWidget(card)
+            body_l.addLayout(cards_row)
+
+            note = card_frame(8)
+            nl = QVBoxLayout(note); nl.setContentsMargins(16,14,16,14)
+            if ok and remaining == 0:
+                nl.addWidget(make_label("Warning: You have no remaining leaves. Any future absence will be unpaid.", 12, DANGER))
+            elif not ok:
+                nl.addWidget(make_label("Info: No leave record found. Ask your admin to set your leave balance.", 12, TEXT3))
+            else:
+                nl.addWidget(make_label(f"Info: You have used {used} out of {total} leaves. {remaining} remaining.", 12, TEXT2))
+            body_l.addWidget(note)
+
+        def _failed_leaves(message):
+            clear_layout(body_l)
+            body_l.addWidget(make_label(f"Could not load leave balance: {message}", 12, DANGER))
+
+        _show_leaves_loading()
+        run_background(self, lambda: get_employee_leaves(emp_id), _render_leaves, _failed_leaves)
         lay.addStretch()
         return page
 
@@ -5068,16 +5841,34 @@ class EmployeeDashboard(QWidget):
         lay.addWidget(make_label("My Leave History", 14, TEXT, bold=True))
         lay.addSpacing(8)
         STATUS_CLR = {"Pending":"#f0a500","Approved":SUCCESS,"Rejected":DANGER,"Reverted":TEXT3,"Revert Requested":"#2980b9"}
-        COLS = ["Type","Duration","From","To","Days","Submitted","Status","Remarks","Action"]
+        COLS = [
+            ("Type", 118), ("Duration", 104), ("From", 92), ("To", 92),
+            ("Days", 64), ("Submitted", 104), ("Status", 118),
+            ("Remarks", 260), ("Action", 92),
+        ]
+        table_min_width = sum(width for _, width in COLS) + 18
+
+        def _history_cell(text, size=12, color=TEXT2, bold=False, width=90, align=Qt.AlignmentFlag.AlignCenter):
+            value = str(text)
+            lbl = make_label(short_text(value, 42), size, color, bold=bold)
+            lbl.setAlignment(align)
+            lbl.setFixedWidth(width)
+            lbl.setMinimumHeight(28)
+            lbl.setToolTip(value)
+            lbl.setSizePolicy(QSizePolicy.Policy.Fixed, QSizePolicy.Policy.Fixed)
+            return lbl
+
         hdr = QWidget(); hdr.setStyleSheet(f"background: {BG}; border-radius: 6px;")
+        hdr.setMinimumWidth(table_min_width)
         hl = QHBoxLayout(hdr); hl.setContentsMargins(6,7,6,7)
-        for c in COLS:
-            l = make_label(c, 11, TEXT3, bold=True); l.setAlignment(Qt.AlignmentFlag.AlignCenter)
-            hl.addWidget(l, 3 if c in ("Type","Remarks") else 1)
-        lay.addWidget(hdr)
+        hl.setSpacing(0)
+        for c, width in COLS:
+            hl.addWidget(_history_cell(c, 11, TEXT3, bold=True, width=width))
         rows_w = QWidget(); rows_w.setStyleSheet("background: transparent;")
+        rows_w.setMinimumWidth(table_min_width)
         rows_l = QVBoxLayout(rows_w); rows_l.setContentsMargins(0,0,0,0); rows_l.setSpacing(6)
-        scroll = make_scroll(rows_w); scroll.setFixedHeight(200); lay.addWidget(scroll); lay.addStretch()
+        table_box, _, _ = make_sticky_table_scroll(hdr, rows_w, rows_height=200, header_height=44)
+        lay.addWidget(table_box); lay.addStretch()
 
         def _reload_revert_options(records=None):
             records = records if records is not None else get_leave_requests(emp_id=emp_id)
@@ -5096,57 +5887,74 @@ class EmployeeDashboard(QWidget):
                 revert_cb.addItem(label, req["request_id"])
 
         def _reload_history():
-            while rows_l.count():
-                item = rows_l.takeAt(0)
-                if item.widget(): item.widget().setParent(None)
-            records = get_leave_requests(emp_id=emp_id)
-            _reload_revert_options(records)
-            if not records:
-                rows_l.addWidget(make_label("No leave requests yet.", 12, TEXT3)); return
-            for i, req in enumerate(records):
-                row = QWidget()
-                row.setStyleSheet(f"background: {'#faf7f2' if i%2==0 else '#f5f0e8'}; border: 1px solid {BORDER}; border-radius: 5px;")
-                rl = QHBoxLayout(row); rl.setContentsMargins(6,8,6,8)
-                status = req["status"]; s_color = STATUS_CLR.get(status, TEXT)
-                leave_reason = str(req.get("reason") or "N/A")
-                revert_reason = str(req.get("revert_reason") or "").strip()
-                remarks = str(req.get("remarks") or "N/A")
-                details = f"Leave: {leave_reason}"
-                if revert_reason:
-                    details += f" | Revert: {revert_reason}"
-                if remarks != "N/A":
-                    details += f" | Remarks: {remarks}"
-                for val, stretch, clr in [
-                    (req["leave_type"],3,TEXT2),(req.get("leave_duration", "Full Day"),1,TEXT2),
-                    (display_date(req["from_date"]),1,TEXT),(display_date(req["to_date"]),1,TEXT),
-                    (req["days"],1,TEXT),(display_date(req["submitted_on"]),1,TEXT3),(status,1,s_color),(details,3,TEXT3)
-                ]:
-                    l = make_label(str(val), 12, clr); l.setAlignment(Qt.AlignmentFlag.AlignCenter)
-                    rl.addWidget(l, stretch)
-                if status == "Approved" and req.get("can_revert", False):
-                    rid = req["request_id"]
-                    revert_btn = QPushButton("Request")
-                    revert_btn.setFixedSize(78, 28)
-                    revert_btn.setCursor(QCursor(Qt.CursorShape.PointingHandCursor))
-                    revert_btn.setToolTip("Request admin to revert this approved leave")
-                    revert_btn.setStyleSheet(f"""
-                        QPushButton {{
-                            background:{BG3};
-                            color:{ACCENT};
-                            border:1px solid {BORDER};
-                            border-radius:5px;
-                            font-size:12px;
-                            font-weight:800;
-                        }}
-                        QPushButton:hover {{ background:{BG}; }}
-                    """)
-                    revert_btn.clicked.connect(lambda _, r=rid: _request_revert(r))
-                    rl.addWidget(revert_btn, 1)
-                else:
-                    l = make_label("—", 12, TEXT3)
-                    l.setAlignment(Qt.AlignmentFlag.AlignCenter)
-                    rl.addWidget(l, 1)
-                rows_l.addWidget(row)
+            show_layout_loading(rows_l, "Loading leave history...", columns=len(COLS), rows=6)
+
+            def _render_history(records):
+                clear_layout(rows_l)
+                _reload_revert_options(records)
+                if not records:
+                    rows_l.addWidget(make_label("No leave requests yet.", 12, TEXT3)); return
+                for i, req in enumerate(records):
+                    row = QWidget()
+                    row.setStyleSheet(f"background: {'#faf7f2' if i%2==0 else '#f5f0e8'}; border: 1px solid {BORDER}; border-radius: 5px;")
+                    row.setMinimumWidth(table_min_width)
+                    row.setMinimumHeight(46)
+                    rl = QHBoxLayout(row); rl.setContentsMargins(6,8,6,8); rl.setSpacing(0)
+                    status = req["status"]; s_color = STATUS_CLR.get(status, TEXT)
+                    leave_reason = str(req.get("reason") or "N/A")
+                    revert_reason = str(req.get("revert_reason") or "").strip()
+                    remarks = str(req.get("remarks") or "N/A")
+                    details = f"Leave: {leave_reason}"
+                    if revert_reason:
+                        details += f" | Revert: {revert_reason}"
+                    if remarks != "N/A":
+                        details += f" | Remarks: {remarks}"
+                    values = [
+                        (req["leave_type"], TEXT2, Qt.AlignmentFlag.AlignCenter),
+                        (req.get("leave_duration", "Full Day"), TEXT2, Qt.AlignmentFlag.AlignCenter),
+                        (display_date(req["from_date"]), TEXT, Qt.AlignmentFlag.AlignCenter),
+                        (display_date(req["to_date"]), TEXT, Qt.AlignmentFlag.AlignCenter),
+                        (req["days"], TEXT, Qt.AlignmentFlag.AlignCenter),
+                        (display_date(req["submitted_on"]), TEXT3, Qt.AlignmentFlag.AlignCenter),
+                        (status, s_color, Qt.AlignmentFlag.AlignCenter),
+                        (details, TEXT3, Qt.AlignmentFlag.AlignVCenter | Qt.AlignmentFlag.AlignLeft),
+                    ]
+                    for (val, clr, align), (_, width) in zip(values, COLS[:-1]):
+                        rl.addWidget(_history_cell(val, 12, clr, width=width, align=align))
+                    if status == "Approved" and req.get("can_revert", False):
+                        rid = req["request_id"]
+                        action_w = QWidget()
+                        action_w.setFixedWidth(COLS[-1][1])
+                        action_w.setStyleSheet("background: transparent; border: none;")
+                        al = QHBoxLayout(action_w); al.setContentsMargins(0,0,0,0); al.setSpacing(0)
+                        al.setAlignment(Qt.AlignmentFlag.AlignCenter)
+                        row_revert_btn = QPushButton("Request")
+                        row_revert_btn.setFixedSize(78, 28)
+                        row_revert_btn.setCursor(QCursor(Qt.CursorShape.PointingHandCursor))
+                        row_revert_btn.setToolTip("Request admin to revert this approved leave")
+                        row_revert_btn.setStyleSheet(f"""
+                            QPushButton {{
+                                background:{BG3};
+                                color:{ACCENT};
+                                border:1px solid {BORDER};
+                                border-radius:5px;
+                                font-size:12px;
+                                font-weight:800;
+                            }}
+                            QPushButton:hover {{ background:{BG}; }}
+                        """)
+                        row_revert_btn.clicked.connect(lambda _, r=rid: _request_revert(r))
+                        al.addWidget(row_revert_btn)
+                        rl.addWidget(action_w)
+                    else:
+                        rl.addWidget(_history_cell("-", 12, TEXT3, width=COLS[-1][1]))
+                    rows_l.addWidget(row)
+
+            def _failed_history(message):
+                clear_layout(rows_l)
+                rows_l.addWidget(make_label(f"Could not load leave history: {message}", 12, DANGER))
+
+            run_background(self, lambda: get_leave_requests(emp_id=emp_id), _render_history, _failed_history)
 
         def _request_revert(request_id):
             dlg = QInputDialog(self)
